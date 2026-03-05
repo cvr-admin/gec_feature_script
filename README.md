@@ -77,9 +77,7 @@ If you extend or improve the system, contributing those improvements back to the
 
 If you are interested in improving the script, adapting it for other eras, or helping expand the realism systems, contributions and pull requests are welcome.
 
-The overall goal is simple:
-
-**to make deeper mechanical realism more common in Assetto Corsa mods as that's what I wish to see more in the scene.**
+The overall goal is simple: **to make deeper mechanical realism more common in Assetto Corsa mods as that's what I wish to see more in the scene.**
 
 ## Installation and integration
 
@@ -91,39 +89,39 @@ The script is divided into multiple files. Here's the short description of them:
 
 ### Lua files
 
-`data/car_parameters.lua` - this file should contain all per car adjustable data. All other files should be used as is.
-`data/electricity.lua` - this contains all electricity feature stuff
-`data/failure_rate_handling.lua` - this handles all the functions that affect dynamically to mechanical issue probabilities
-`data/script_psg.lua` - this has functionality for preselector gearbox
-`data/script_switch_throttle_model.lua` - the improved throttle model. It really makes a difference, but can't be included here. Contains instructions to download it's content from CSP Discord
-`data/script.lua` - the main loop functionality
-`data/supecharger.lua` - handles the supercharger issues
-`extension/car_parameters.lua` - contains position for radiator cap for steam effect
-`extension/chattyjeff.lua` - the original talking riding mechanic. This is to be removed in the future (transferred to external app)
-`extension/electricity_ext.lua` - controls the battery's effect on lights
-`extension/extra_visual_effects.lua` - control the visual effects of the script like steam from radiator and smoke from exploded supercharger
-`extension/psg.lua` - some sounds for preselector gearbox
+- `data/car_parameters.lua` - this file should contain all per car adjustable data. All other files should be used as is.
+- `data/electricity.lua` - this contains all electricity feature stuff
+- `data/failure_rate_handling.lua` - this handles all the functions that affect dynamically to mechanical issue probabilities
+- `data/script_psg.lua` - this has functionality for preselector gearbox
+- `data/script_switch_throttle_model.lua` - the improved throttle model. It really makes a difference, but can't be included here. Contains instructions to download it's content from CSP Discord
+- `data/script.lua` - the main loop functionality
+- `data/supecharger.lua` - handles the supercharger issues
+- `extension/car_parameters.lua` - contains position for radiator cap for steam effect
+- `extension/chattyjeff.lua` - the original talking riding mechanic. This is to be removed in the future (transferred to external app)
+- `extension/electricity_ext.lua` - controls the battery's effect on lights
+- `extension/extra_visual_effects.lua` - control the visual effects of the script like steam from radiator and smoke from exploded supercharger
+- `extension/psg.lua` - some sounds for preselector gearbox
 
 ### Other files
 
-`data/engine_map0_rich.lut` - rich fuel mix effect on engine torque
-`data/engine_map1_normal.lut` - normal fuel mix effect on engine torque
-`data/engine_map2_lean.lut` - lean fuel mix effect on engine torque
-`data/engine_map3_push.lut` - push fuel mix effect on engine torque
-`data/engine_mixture.lut` - defines the fuel mixture options for setup
-`data/mechanic_setup.lut` - just a boolean lut for setup
-`data/radiator.lut` - defines the radiator shutter options for setup
-`data/sparewheels.lut` - defines the sparewheel options for setup
-`extension/sfx/*.*` - sounds used by the script
-`extension/watertemp_display.ini` - defines the custom script (watertemp and ammeter) gauges in car's dashboard
+- `data/engine_map0_rich.lut` - rich fuel mix effect on engine torque
+- `data/engine_map1_normal.lut` - normal fuel mix effect on engine torque
+- `data/engine_map2_lean.lut` - lean fuel mix effect on engine torque
+- `data/engine_map3_push.lut` - push fuel mix effect on engine torque
+- `data/engine_mixture.lut` - defines the fuel mixture options for setup
+- `data/mechanic_setup.lut` - just a boolean lut for setup
+- `data/radiator.lut` - defines the radiator shutter options for setup
+- `data/sparewheels.lut` - defines the sparewheel options for setup
+- `extension/sfx/*.*` - sounds used by the script
+- `extension/watertemp_display.ini` - defines the custom script (watertemp and ammeter) gauges in car's dashboard
 
 ### Existing files you may need to modify
 
-`data/brakes.ini` - add the brake duct options for setup
-`data/drivetrain.ini` - add the preselector animation keys
-`data/engine.ini` - add the fuel mix and throttle model sections
-`data/setup.ini` - add setup items for radiator, brake ducts and fuel mix + some other script specific stuff
-`extension/ext_config.ini` - add the Extra button behaviour section
+- `data/brakes.ini` - add the brake duct options for setup
+- `data/drivetrain.ini` - add the preselector animation keys
+- `data/engine.ini` - add the fuel mix and throttle model sections
+- `data/setup.ini` - add setup items for radiator, brake ducts and fuel mix + some other script specific stuff
+- `extension/ext_config.ini` - add the Extra button behaviour section
 
 ## Credits
 
