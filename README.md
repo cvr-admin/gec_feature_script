@@ -4,7 +4,7 @@
 
 Assetto Corsa has fantastic physics, but many races still end up being little more than endless hotlapping. The goal of this project is to add deeper **mechanical realism** so that managing the car becomes part of the challenge, not just chasing the next fast lap.
 
-This release introduces the **GEC mechanical systems framework**, a Lua-based script ecosystem designed primarily for **vintage racing cars**.
+This release introduces the **Mechanical Realism Framework**, a Lua-based script ecosystem designed primarily for **vintage racing cars**.
 
 To make it easy to try, the framework is packaged here as a ready-to-drive car (shared with permission from *nicecuppatea*). The car itself is only a demonstration platform — the real purpose of this release is the **script framework**, which modders can integrate into their own cars.
 

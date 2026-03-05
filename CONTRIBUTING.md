@@ -1,6 +1,6 @@
 # Contributing to the Mechanical Realism Framework (MRF)
 
-Thank you for your interest in improving the GEC script ecosystem.
+Thank you for your interest in improving the MRF script ecosystem.
 
 This project aims to expand the mechanical realism of vintage race cars in Assetto Corsa by simulating systems that are usually ignored in sim racing, such as electrical systems, component wear, and mechanical management.
 
