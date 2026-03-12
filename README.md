@@ -123,6 +123,10 @@ The script is divided into multiple files. Here's the short description of them:
 - `data/setup.ini` - add setup items for radiator, brake ducts and fuel mix + some other script specific stuff
 - `extension/ext_config.ini` - add the Extra button behaviour section
 
+## In depth documentation
+
+WIP
+
 ## Credits
 
 * SLIGHTLYMADESTUDIOS / Tunari - made the first iteration and showed the way to proceed further
