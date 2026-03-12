@@ -55,9 +55,9 @@ require "script_psg"
 
 -- Enable/disable debug prints and test code.
 -- *** Must always be false in release packages! ***
-local DEBUG = false
+local DEBUG = true
 local DEBUG_LOG_FILE = true  -- Left logging enabled for release 2.0.
-local TEST_CODE = false
+local TEST_CODE = true
 
 -- Override can be used to temporarily ignore the DEBUG flag,
 -- if you want to print only certain debug data, but not all.
