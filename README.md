@@ -83,6 +83,8 @@ The overall goal is simple: **to make deeper mechanical realism more common in A
 
 Installing the framework requires you have access to cars data that exists in data and extension folders. If those doesn't exist you need to unpack the `data.acd` file and then implement and edit the necessary files. If you wish to use the car in online, you need to pack the data into a new `data.acd` file.
 
+The framework also utilises improved throttle model, which is not included due to lisencing differencies, but it's strongly recommended to download (https://discord.com/channels/453595061788344330/1331330678893183058) it too and include to the framework. It requires that you uncomment its calling from `script.lua` (rows 54 and 1777).
+
 The script also relies into some CSP features and using extended physics is strongly recommended to get all the features. Always use the latest CSP version unless it has some deal braking issues for you. 
 
 The script is divided into multiple files. Here's the short description of them:
@@ -122,6 +124,10 @@ The script is divided into multiple files. Here's the short description of them:
 - `data/engine.ini` - add the fuel mix and throttle model sections
 - `data/setup.ini` - add setup items for radiator, brake ducts and fuel mix + some other script specific stuff
 - `extension/ext_config.ini` - add the Extra button behaviour section
+
+## In depth documentation
+
+WIP
 
 ## Credits
 
