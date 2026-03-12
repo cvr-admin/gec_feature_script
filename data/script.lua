@@ -1774,9 +1774,10 @@ function update(dt)
     end
     printDebug("isCarInPits", isCarInPits)
 
-    if ac.getSim().inputMode ~= ac.UserInputMode.Keyboard then
-        switch_throttle_model.runThrottleModel()
-    end
+    -- Uncomment below once you have throttle model lua in place
+    --if ac.getSim().inputMode ~= ac.UserInputMode.Keyboard then
+    --    switch_throttle_model.runThrottleModel()
+    --end
 
     logExtraButtonPresses()
     logCarEnterAndLeavePits()
