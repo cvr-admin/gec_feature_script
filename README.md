@@ -127,7 +127,311 @@ The script is divided into multiple files. Here's the short description of them:
 
 ## In depth documentation
 
-WIP
+This car uses a configurable Custom Shaders Patch (CSP) Lua car-physics
+ecosystem. It adds period-appropriate reliability, fluids, cooling, electrical,
+drivetrain, tyre, brake and repair behaviour while retaining Assetto Corsa's
+normal driving model. The same `data` Lua files can be copied to another car;
+adapt that car primarily through `data/script_car_parameters.lua`, then keep
+the matching CSP setup entries in `data/setup.ini`.
+
+### Features
+
+- Mechanical reliability: spark-plug fouling, fuel-pump faults, oil-pressure
+  faults, valve damage, gearbox failures, turbo/supercharger faults and
+  overrev/lugging stress.
+- Engine temperature: radiator and air-cooled thermal models, cooling-intake
+  adjustment, body-damage cooling loss, heat-related power loss and overheat
+  damage.
+- Air-cooled hardware: fan-belt slip or failure, generator loss, fan/shroud
+  damage, pit repair and roadside belt replacement.
+- Oil and fuel systems: oil pressure, tank capacity/consumption, automatic or
+  manual oil pumping, tank punctures, fuel leaks, optional manual fuel-tank
+  pressurisation and oil-spill data for companion online scripts.
+- Drivetrain: H-pattern, non-synchromesh and double-clutch rules, dogbox,
+  Wilson preselector and Cotal electric gearbox support.
+- Tyres and brakes: wear, surface-sensitive punctures, crash blowouts, spare
+  wheels, roadside tyre changes, brake wear and brake blanking.
+- Electrical system: battery charge/capacity, alternator output, damage,
+  overheating, belt repair and weak-battery ignition effects.
+- Repairs and feedback: pit repair queues, roadside service where appropriate,
+  overhead messages, Lua Debug outputs, CVR Pit Crew app integration and AI
+  mechanical issues.
+- CVR Pit Crew can also initiate one supported roadside service while the car
+  is stopped outside the pit box. It offers only punctured tyres, spark plugs
+  and belt-driven charging/fan faults that the car can actually repair there.
+- Crash effects: controlled engine-fire outputs for an engine destroyed in a
+  sufficiently severe impact. Visual particles are configured separately in
+  `extension/car_parameters.lua`.
+
+### CSP Integration
+
+#### Fuel mixture and engine maps
+
+`data/setup.ini` exposes CSP's `[ENGINE_MAPS]` control. The matching
+`data/engine_mixture.lut` defines the visible map names and map indexes:
+
+```text
+Rich|0
+Normal|1
+Lean|2
+Push|3
+```
+
+The driver can change maps with CSP's Engine Map control. Lua reads the active
+map from `thisCar.fuelMap`; the parameter tables use the same order, but Lua
+table indexes are one-based:
+
+```lua
+-- Lua table order: rich, normal, lean, push
+engineHeatGainEngineMapFactors = {0.90, 1.00, 1.20, 1.30}
+sparkPlugEngineMapFactors = {1.20, 1.00, 0.82, 0.58}
+```
+
+Keep `engine_mixture.lut`, the setup map indexes and every `*EngineMapFactors`
+table aligned. If a car needs fewer maps, keep the four map slots and make the
+unused maps equivalent to Normal rather than changing their indexes.
+
+#### Custom CSP setup items
+
+The Lua script reads these IDs from `data/setup.ini`:
+
+| ID | Purpose |
+| --- | --- |
+| `RADIATOR` | Cooling-intake shielding or shutters. It also works for air-cooled intake restriction. |
+| `SPARE_WHEELS` | Number of carried spare wheels for roadside tyre service. |
+| `BRAKE_DUCT_F`, `BRAKE_DUCT_R` | Brake blanking, brake cooling and associated drag. |
+| `DOUBLE_CLUTCH_GEARBOX` | Optional non-synchromesh/double-clutch behaviour. |
+| `MANUAL_OIL_PUMP` | Requires Extra C oil-pump operation when enabled. |
+| `MANUAL_FUEL_PRESSURE` | Requires Extra G fuel-tank air pumping when enabled. |
+| `OVERHEAD_MESSAGES` | Enables or disables Lua system messages. |
+
+Do not rename or remove an ID used by the script. For a feature a car does not
+use, keep its setup item with a disabled default or a one-value LUT.
+
+#### CSP outputs for instruments and apps
+
+The script publishes state through `CPHYS_SCRIPT_n` controller inputs. This
+allows digital instruments, Lua apps and visual scripts to read live data. The
+following assignments are the compatibility map for this ecosystem. Inputs not
+listed here are unused/reserved and should not be repurposed in a compatible
+car copy.
+
+| Input | Value | Notes |
+| --- | --- | --- |
+| `0` | Display coolant/temperature | Degrees C. Air-cooled cars receive a lagged head/engine display value. |
+| `1` | Direct engine temperature | Degrees C. |
+| `2` | Spare wheels | Current carried-spare count. `-1` means trackside supply. |
+| `3` | Roadside tyre-service stop timer | Seconds stopped while the tyre-service routine is active. |
+| `4` | Brake damage | Boolean. |
+| `5` | Idle RPM target | RPM used by the starter/stall system. |
+| `6` | Engine RPM | Live physics RPM exposed by the starter/stall system. |
+| `7` | Oil-pressure failure active | Boolean progressive engine-failure state. |
+| `8` | Valve failure active | Boolean. |
+| `9` | Fuel-pump failed | Boolean. |
+| `10` | Spark-plug failure active | Boolean. |
+| `11` | Brake fade | Fraction from `0` to `maxBrakeFade`. |
+| `12` | Gearbox repair active | Boolean. |
+| `13` | Fuel-pump repair active | Boolean. |
+| `14` | Broken gear present | Boolean. |
+| `15` | Body cooling damage | Boolean, for radiator or configured air-cooling intake damage. |
+| `16` | Tyre puncture present | Boolean. |
+| `17` | Spare-tyre stock empty | Boolean. |
+| `20` | Altitude | CSP altitude value. |
+| `21` | Air density | CSP air-density value. |
+| `22` | Forced induction installed | Boolean for CSP turbo/supercharger hardware. |
+| `23` | Boost limit exceeded | Boolean. |
+| `24` | Failed turbo/supercharger count | Number of failed units. |
+| `25` | Turbo failure smoke trigger | Boolean visual/event signal. |
+| `26` | Reset brake wear on tyre change | Boolean configuration state. |
+| `27` | Race pit-teleport lockout | Boolean. |
+| `28` | CSP fuel mixture/engine map | `0=Rich`, `1=Normal`, `2=Lean`, `3=Push`. |
+| `29` | Cooling intake/shutter setup | Setup index from `RADIATOR`. |
+| `30` | Turbo enabled | Boolean. |
+| `31` | Nearest tyre-stack distance | Metres along the track spline. |
+| `32` | Overrev state | `0=normal`, `1=warning`, `2=severe`. |
+| `33` | Fuel leakage damage | Boolean. |
+| `34` | Low-fuel starvation threshold | Litres from `fuelExhaustionAmount`, not current fuel level. |
+| `35-38` | Spark, fuel-pump, oil-pressure and valve failure rates | Current random-roll denominators, in that order. Higher means rarer. |
+| `39` | Brake fade start | Brake wear level where fade begins. |
+| `40` | Brake wear level | `0-1000` cumulative brake-wear scale. |
+| `41` | Low-RPM state | Boolean. |
+| `42` | Roadside tyre-service state | `0=idle`, `1=fetching tyre`, `2=changing tyre`, `3=complete`. |
+| `43` | Net electrical flow | Amps. Positive charges the battery; negative discharges it. |
+| `44` | Battery charge | Percentage. |
+| `45` | Battery maximum capacity | Percentage. |
+| `46` | Alternator operating | Boolean. |
+| `47` | Alternator output | Amps. |
+| `48` | Alternator health | Fraction from `0` to `1`. |
+| `49` | Wilson preselector selected gear | Gear index. Only relevant to PSG cars. |
+| `50` | Wilson preselector shift animation | Boolean. Only relevant to PSG cars. |
+| `51` | Ignition type | `1=magneto`, `2=battery`, `3=hybrid`. |
+| `52` | Alternator belt repair active | Boolean. |
+| `53` | Oil pressure | PSI. |
+| `54` | Oil tank quantity | Litres. |
+| `55` | Oil tank fill fraction | `0=empty`, `1=full`. |
+| `56` | Manual oil pump active | Boolean. |
+| `57` | Oil-pressure damage active | Boolean. |
+| `58` | Oil pit service active | Boolean. |
+| `59` | Oil tank leaking | Boolean. |
+| `60` | Oil leak rate | Litres per minute. |
+| `61` | Oil pump damaged | Boolean. |
+| `62` | Oil pump efficiency | Fraction from `0` to `1`. |
+| `63` | Manual fuel pressurisation enabled | Boolean. |
+| `64` | Fuel-tank pressure | PSI. |
+| `65` | Fuel pressure pump active | Boolean. |
+| `66` | Fuel pressure low | Boolean. |
+| `67` | Fuel-pressure fuel cut active | Boolean. |
+| `68` | Fuel pressure fraction | Current pressure divided by target pressure. |
+| `69` | Fouled spark-plug count | Count. |
+| `70` | Dead-cylinder count | Count. |
+| `71` | Spark-plug power loss | Fraction from `0` to `1`. |
+| `72` | Spark-plug service active | Boolean. |
+| `73` | Cooling-system type | `1=radiator`, `2=air`. |
+| `74` | Air-cooling fault state | `0=OK`, `1=belt slip`, `2=belt broken`, `3=fan/shroud damage`. |
+| `75` | Air-cooling fan efficiency | Fraction from `0` to `1`. |
+| `76` | Generator efficiency | Fraction from `0` to `1`. |
+| `77` | Fan-belt stress | Cumulative stress value. |
+| `78` | Air-cooling repair active | Boolean. |
+| `79` | Air-cooling repair progress | Fraction from `0` to `1`. |
+| `80` | Engine crash fire active | Boolean visual trigger. |
+| `81` | Engine crash fire intensity | Fraction from `0` to `1`. |
+| `82` | Engine crash fire time remaining | Fraction from `1` at ignition to `0` at expiry. |
+| `83` | PSG animationState helper | float from neutral to highest gear, so for 4 gears: from `1` to `5` |
+| `84` | Air-cooling fan-drive type | `0=not air cooled`, `1=shared belt`, `2=separate belt`, `3=gear driven`, `4=direct driven`, `5=no mechanical fan`. |
+
+### Per-Car Tuning
+
+Make normal car-specific changes in `data/script_car_parameters.lua`. Start
+with the groups below, test the car at race pace and in pit/repair scenarios,
+then make small changes. Higher random-failure denominators mean rarer faults.
+
+#### Core reliability
+
+- `failureRateSessionRandomness`: session-to-session reliability variation;
+  set `0` for fully repeatable testing.
+- `sparkPlugFailureRateNominalValue`, `fuelPumpFailureRateNominalValue`,
+  `valveFailureRateNominalValue`, `oilPressureFailureRateNominalValue`:
+  base failure rarity. Use higher values for a more reliable engine.
+- `*EngineMapFactors`: four values in Rich, Normal, Lean, Push order. Values
+  above `1.0` reduce risk, while values below `1.0` increase it.
+- `valveReferenceRPM`, `oilPressureReferenceRPM`: set around the RPM where
+  sustained hard running should begin to create meaningful stress.
+
+#### Fuel mixture and engine heat
+
+- `engineHeatGainEngineMapFactors`: heat generated by each CSP engine map.
+  Keep Rich below Normal and Push above Normal unless the real engine requires
+  a different relationship.
+- `engineHeatGainMultiplier`, `engineIdleHeatGainCelsiusPerSecond`,
+  `engineFullLoadHeatGainCelsiusPerSecond`: establish the car's normal race
+  temperature before tuning damage thresholds.
+- `engineTemperaturePowerCurve`: power reduction as temperature rises. Keep
+  full power through the real engine's normal operating range, then reduce it
+  progressively before severe damage.
+
+#### Cooling system
+
+- `coolingSystemType`: `COOLING_SYSTEM_RADIATOR` or `COOLING_SYSTEM_AIR`.
+- `coolingDamageSides = {front, rear, left, right}`: body areas whose damage
+  obstructs the main cooling flow. Examples: front radiator
+  `{true, false, false, false}`, sidepod radiators `{false, false, true, true}`
+  and rear-engine air cooling `{false, true, false, false}`.
+- `airCoolingFanShroudDamageSides = {front, rear, left, right}`: collision
+  areas that can damage an air-cooled fan or shroud. Keep this separate from
+  intake damage: for a rear-engine car it is usually `{false, true, false,
+  false}`. AC side damage spans the entire car length, so include a side only
+  when a side impact can genuinely reach the fan/shroud.
+- `engineOverheatWarningTemperatureCelsius`,
+  `engineOverheatDamageStartTemperatureCelsius`,
+  `engineOverheatSeizureTemperatureCelsius`: choose these from the engine's
+  plausible head, oil or coolant limits and keep a sensible gap between them.
+- Radiator cars: `radiatorStillAirCoolingPerSecond`,
+  `radiatorAirflowCoolingPerSecond`, `radiatorDamageCoolingLoss` and shutter
+  settings determine stationary, speed-based and damaged cooling.
+- Air-cooled cars: `airCoolingStillCoolingPerSecond`,
+  `airCoolingFanCoolingPerSecond`, `airCoolingRamAirCoolingPerSecond`,
+  `airCoolingFanReferenceRpm` and `airCoolingDamageCoolingLoss` determine
+  fan and road-speed cooling. Tune these against ambient temperature, race
+  speed and full-load RPM.
+- Air-cooled fan drive: set `airCoolingFanDriveType` to the real arrangement:
+  `AIR_COOLING_FAN_DRIVE_SHARED_BELT` (fan and generator share a belt),
+  `AIR_COOLING_FAN_DRIVE_SEPARATE_BELT`,
+  `AIR_COOLING_FAN_DRIVE_GEAR_DRIVEN`,
+  `AIR_COOLING_FAN_DRIVE_DIRECT_DRIVEN`, or `AIR_COOLING_FAN_DRIVE_NONE` for
+  ram-air-only cooling. Belt slip/break faults and roadside belt changes apply
+  only to the two belt-driven types. Gear/direct fans can still suffer
+  pit-only fan or shroud damage; a no-fan layout has no fan repair item.
+
+#### Oil and fuel systems
+
+- `oilTankCapacityLitres`, `oilOptimalPressurePsi`,
+  `oilLowPressureWarningPsi`, `oilCriticalPressurePsi` and
+  `oilPressureReferenceRpm`: match the engine's oil system first.
+- `oilAutomaticPumpAssistantEnabled`: use `true` for a conventional automatic
+  pressure system, or `false` for a driver-operated/manual oil system.
+- `oilBaseConsumptionLitresPerMinute`, `oilDemandConsumptionLitresPerMinute`:
+  normal oil use at light and hard running.
+- `oilLeakageDamageSides`, `oilLeakageDamageThreshold`,
+  `oilLeakageDamageChance`, `oilLeakageRateMinLitresPerMinute`,
+  `oilLeakageRateMaxLitresPerMinute`: crash-puncture location, severity and
+  leak-rate range. The tank still drains without an online spill script.
+- `manualFuelPressurizationEnabled` and `fuelTank*` values: enable only for
+  cars with a driver-managed pressure-fed fuel system.
+- `fuelLeakageDamageSides`, `fuelLeakageDamageThreshold` and
+  `fuelLeakageDamageChance`: define fuel-tank crash vulnerability.
+
+#### Drivetrain, starting and electricity
+
+- `gearboxType`: select the real gearbox before adjusting any related values.
+  Enable double-clutch or dogbox rules only where they are historically and
+  mechanically appropriate.
+- `doubleClutch*` and `dogbox*`: tune clutch travel, neutral time, RPM
+  tolerance and damage only after testing with the intended shifter hardware.
+- `engineIdleRpm`, `engineLowRpmStallGraceSeconds`,
+  `engineLowRpmStallSaveThrottle`, `engineBumpStart*`: set the engine's idle,
+  stall recovery window and bump-start behaviour.
+- `ignitionType`: `1` magneto, `2` battery, `3` hybrid. Use the battery and
+  alternator parameters only for cars that genuinely use this system.
+- `batteryDamageSides` and `alternatorDamageSides`: body zones in `{front,
+  rear, left, right}` which can crash-damage each component. Place them where
+  the battery and generator/alternator physically sit; each selected zone is
+  averaged, so selecting extra sides makes any one impact less severe.
+- `suspensionShockThreshold`: wheel damper speed in m/s above which sustained
+  harsh suspension movement gradually reduces battery capacity. Start around
+  `3.0` for a normally secured post-war lead-acid battery; lower values make
+  ordinary kerbs and rough surfaces progressively more damaging.
+- `alternatorOutputRpmOffset`, `alternatorOutputRpmRange`,
+  `alternatorOutputMaxAmps`, `batteryCapacityAh` and electrical loads should
+  give stable charging at normal racing RPM without making idling unrealistically
+  powerful.
+
+#### Tyres, brakes, forced induction and AI
+
+- `tyrePunctureRate*`, `tyreBlowDamageChange*`, `tyreWear*` and
+  `tyreTypeFactors`: set for the era, surface and intended tyre compounds.
+- `pitTyreChangesCanRunWithRepairs`: `true` lets tyre changes run alongside
+  mechanical repairs; set `false` when one crew must complete its work before
+  the other begins. Roadside tyre service is unaffected.
+- `spareWheelMass`, spare-wheel LUT and tyre replacement times: balance period
+  practice with the car's packaging and race format.
+- `baseWearRate`, `brakeFadeStart`, `maxBrakeFade`, `maxBrakeTorque` and brake
+  blanking: match the brake type and expected race distance.
+- `turboFailure*` and `turboBoostAfterFailurePercent*`: leave irrelevant for
+  naturally aspirated cars; tune only when the car has CSP turbo hardware.
+- `aiMechanicalIssuesMode`: `1` off, `2` mild, `3` realistic. Keep AI failure
+  rates more conservative than player-facing features for stable races.
+
+### Validation Checklist
+
+1. Test cold start, idle, full-load laps and cooldown at representative ambient
+   temperatures.
+2. Test every fuel mixture and verify heat, reliability and performance match
+   its intended role.
+3. Test a pit stop with each enabled repair plus any enabled roadside service.
+4. Test collisions on each configured `coolingDamageSides`, oil-tank and
+   fuel-tank side.
+5. Check Lua Debug and any `CPHYS_SCRIPT_n` instruments or companion apps
+   after changing controller output behaviour.
 
 ## Credits
 

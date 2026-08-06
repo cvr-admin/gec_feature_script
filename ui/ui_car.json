@@ -1,5 +1,5 @@
 {
-  "name": "1937 - GEC - Bugatti Type 57G Tank",
+  "name": "(1937 - GEC - Bugatti Type 57G Tank (feature script))",
   "brand": "Bugatti",
   "description": "This car has Mechanical Realism Framework for Assetto Corsa (MRF) for interwar era cars. Use Extra A to start the engine.<br>The first French winner of Le Mans since 1926, the iconic Bugatti 57G took its place in racing history by winning the 1937 race. Car no.2, alternately driven by Jean-Pierre Wimille and Robert Benoist, quickly took and held the lead, it&#39;s streamlined shape reportedly giving it a clear advantage in fuel economy, allowing it to lap more and pit less.<br><br>Although a possible one-two was thwarted by the no.1 car (driven by Roger Labric and Pierre Veyron) retiring after 130 laps, Wimille and Benoist covered a record-breaking 3287.938 kms or 243 laps, 7 more laps (103km/64 m) than the second place Delahaye 135 CS, at an average speed of 136.997 km/h. A lead that might have been greater but for an 11 minute pause to recover the car after an accident. Roger Labric also set the race&#39;s fastest lap of 5:13 before his car&#39;s retirement.<br><br>A modified and supercharged variant of the car won again in 1939. A success that was quickly overshadowed by the tragic death of Jean Bugatti (Ettore Bugatti&#39;s eldest son), the driving force behind the car&#39;s development, on August 11th 1939 whilst testing the car at high speed.<br><br>Credits<br><br>* SLIGHTLYMADESTUDIOS / Tunari - made the first iteration and showed the way to proceed further<br>* kapasaki - took the project a giant leap forward an into a whole new level<br>* DimitriHarkov - finished the electricity system and made the preselector part<br>* SwitchPro and Ustahl - wrote the throttle model script<br>* Garamond247 - started the project, made some clumsy stuff for others to improve and supervised the project all along<br><br>If you have any comments or suggestions, you find us from the CVR Discord: https://discord.gg/pBFzwUw74m<br>For more info on how to use all the features see: https://vintageracers.eu/news/setup-guide-for-interwar-cars/",
   "tags": [
@@ -251,8 +251,7 @@
   ],
   "country": "France",
   "author": "Nicecuppatea",
-  "version": "2.6",
+  "version": "3.3",
   "url": "https://vintageracers.eu/",
-  "year": 1937,
-  "parent": "bugatti_type_57g"
+  "year": 1937
 }

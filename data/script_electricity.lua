@@ -5,19 +5,12 @@
 -- ORIG_RPM_LIMIT and ORIG_IDLE_RPM are set once during first update tick
 local last_engaged    = last_engaged or 1
 local idleRPM         = nil
-local stageTriggered  = nil
-local prevFrontDamage = nil
+local batteryDamageStages = batteryDamageStages or { false, false, false, false }
+local alternatorDamageStages = alternatorDamageStages or { false, false, false, false }
+local prevBatteryDamage = prevBatteryDamage or 0
+local prevAlternatorDamage = prevAlternatorDamage or 0
 
--- Persistent state
-if not stageTriggered then
-    stageTriggered = { false, false, false, false }
-end
-
-if not prevFrontDamage then
-    prevFrontDamage = 0
-end
-
--- Stage definitions: front-damage thresholds and failure probabilities
+-- Stage definitions: selected body-damage thresholds and failure probabilities.
 local damageStages = {
     { threshold = 0.10, probability = 0.10 },
     { threshold = 0.30, probability = 0.25 },
@@ -39,6 +32,10 @@ local optimizationTimerLoc = 0  -- throttle some checks to every ~2s instead of 
 
 local altWetTreshold = nil
 
+local heatLogTimer = 0
+local vibrationTimer = 0
+local cvrPitCrewRoadsideElectricityService = false
+
 -- Some CSP Lua contexts don't expose ac.setCondition()
 local function setConditionSafe(name, value)
     if ac.setCondition then
@@ -55,6 +52,33 @@ local function saturate(x)
     return math.clamp(x, 0, 1)
 end
 
+local function getElectricalComponentDamage(car, sides, defaultSides)
+    local damage = car and car.damage
+    if not damage then
+        return 0
+    end
+
+    local selectedSides = sides or defaultSides
+    local totalDamage = 0
+    local selectedSideCount = 0
+    for damageIndex = 0, 3 do
+        if selectedSides[damageIndex + 1] then
+            totalDamage = totalDamage + (damage[damageIndex] or 0)
+            selectedSideCount = selectedSideCount + 1
+        end
+    end
+
+    return selectedSideCount > 0 and saturate((totalDamage / selectedSideCount) / 200.0) or 0
+end
+
+local function getDamageStageState(damageN)
+    local state = {}
+    for i, stage in ipairs(damageStages) do
+        state[i] = damageN >= stage.threshold
+    end
+    return state
+end
+
 -- End an active battery-cut event (hoisted to file scope to avoid re-creation per frame)
 local function endCut()
     batteryCutActive = false
@@ -62,13 +86,53 @@ local function endCut()
 end
 
 
-function ResetEle()   -- I got the feeling some values are missing here - tests will show
-    alternatorOK = true
-    alternatorHealth = 1.0
-    batteryCurrentCharge = 100.0
-    batteryMaxCapacity = 100.0
+function ResetEle(resetComponents)
+    local acCar = ac.getCar(0)
+    local batteryDamageN = getElectricalComponentDamage(acCar, batteryDamageSides, {true, false, false, false})
+    local alternatorDamageN = getElectricalComponentDamage(acCar, alternatorDamageSides, {false, true, false, false})
+
+    -- Session resets restore components. Pit body repair can refresh the car
+    -- model too, but must not repair the battery, generator or belt.
+    if resetComponents ~= false then
+        alternatorOK = true
+        alternatorHealth = 1.0
+        batteryCurrentCharge = 100.0
+        batteryMaxCapacity = 100.0
+    end
+
+    -- Roadside repair
     isRepairingBelt = false
     beltRepairTimer = 0
+    cvrPitCrewRoadsideElectricityService = false
+
+    -- Battery ignition cut-out
+    batteryCutActive = false
+    batteryCutTimer  = 0
+
+    -- Damage stage tracking
+    batteryDamageStages = getDamageStageState(batteryDamageN)
+    alternatorDamageStages = getDamageStageState(alternatorDamageN)
+    prevBatteryDamage = batteryDamageN
+    prevAlternatorDamage = alternatorDamageN
+
+    -- Electrical gearbox memory
+    last_engaged = 1
+
+    -- Optimization throttle
+    optimizationTimerLoc = 0
+
+    heatLogTimer = 0
+    vibrationTimer = 0
+
+    -- Restore AC engine RPM settings (may have been lowered by dead-battery logic)
+    if ORIG_IDLE_RPM or idleRPM then
+        ac.setEngineRPMIdle(ORIG_IDLE_RPM or idleRPM)
+    end
+    if ORIG_RPM_LIMIT then
+        ac.setEngineRPMLimit(ORIG_RPM_LIMIT)
+    end
+
+    -- Controller output
     ac.accessCarPhysics().controllerInputs[52] = 0
 end
 
@@ -76,10 +140,17 @@ end
 -- Debug snapshot (shown in Lua Debug App via ac.debug())
 ElecDbg = ElecDbg or {}
 local _dbgTimer = 0
+local electricityDebugEnabled = false
+local electricityDebugInterval = 0.25
+
+function setElectricityDebugEnabled(enabled, interval)
+    electricityDebugEnabled = enabled == true
+    electricityDebugInterval = interval or electricityDebugInterval
+end
 
 function debugElectricity(dt)
-    if not DEBUG_ELECTRICITY then return end
-    local interval = DEBUG_ELECTRICITY_INTERVAL or 0.25
+    if not electricityDebugEnabled then return end
+    local interval = electricityDebugInterval
     _dbgTimer = _dbgTimer + (dt or 0)
     if _dbgTimer < interval then return end
     _dbgTimer = 0
@@ -103,10 +174,11 @@ function debugElectricity(dt)
     ))
 
     ac.debug("ELEC stress", string.format(
-        "temp%s %.1fC | frontDmg %.2f | maxDamper %.3f",
+        "temp%s %.1fC | batImpact %.2f | genImpact %.2f | maxDamper %.3f",
         ElecDbg.tempSrc or "?",
         ElecDbg.temp or 0,
-        ElecDbg.frontDamageN or 0,
+        ElecDbg.batteryDamageN or 0,
+        ElecDbg.alternatorDamageN or 0,
         ElecDbg.maxDamperSpeed or 0
     ))
 
@@ -130,6 +202,8 @@ function updateElectricity(dt)
     local acCarPhysics = ac.accessCarPhysics()
     local carState     = ac.getCar(0)
     local cond         = ac.getConditionsSet()
+    local batteryDamageN = getElectricalComponentDamage(carState, batteryDamageSides, {true, false, false, false})
+    local alternatorDamageN = getElectricalComponentDamage(carState, alternatorDamageSides, {false, true, false, false})
 
     -- Note: 'alternatorOK' = belt status, 'alternatorHealth' = alternator unit itself
 
@@ -162,6 +236,9 @@ function updateElectricity(dt)
     if rainFactor > 0 then
         slipFactor = 1.0 - rainFactor * 0.2
     end
+    if getAirCoolingGeneratorEfficiency then
+        slipFactor = slipFactor * getAirCoolingGeneratorEfficiency()
+    end
 
     -- 1) VIBRATION / SHOCK via damperSpeed
     -- Must run every tick to catch transient suspension spikes.
@@ -174,6 +251,15 @@ function updateElectricity(dt)
     end
     if maxDamperSpeed > suspensionShockThreshold then
         batteryMaxCapacity = math.clamp(batteryMaxCapacity - 0.1 * dt, 5.0, 100.0)
+        vibrationTimer = 1
+    else
+        if vibrationTimer > 0 then
+            vibrationTimer = vibrationTimer - dt
+        end
+        if vibrationTimer < 0 then
+            logDebug("Battery capacity after vibration damage: " .. batteryMaxCapacity)
+            vibrationTimer = 0
+        end
     end
 
     -- 2) HEAT (sanitized)
@@ -185,45 +271,50 @@ function updateElectricity(dt)
     if temp > tempThresholdElectricity then
         local heatDamage = (temp - tempThresholdElectricity) * 0.0001
         alternatorHealth = math.clamp(alternatorHealth - heatDamage * dt, 0.0, 1.0)
+        heatLogTimer = heatLogTimer + dt
+        if heatLogTimer >= 10 then
+            logDebug("Alternator health after heat damage: " .. alternatorHealth)
+            heatLogTimer = 0
+        end
     end
 
-    -- Hoist dmgFrontN so it's available for the debug snapshot below
-    local dmgFrontN = 0
-
     if optimizationTimerLoc > 2 then
-
-        -- 3) FRONT DAMAGE (carState.damage[] as proxy)
-        local dmgFront = 0
-        if carState and carState.damage and carState.damage[0] then
-            dmgFront = carState.damage[0]
+        -- 3) BODY DAMAGE: battery and generator have separate, car-defined locations.
+        if batteryDamageN < prevBatteryDamage * 0.85 then
+            batteryDamageStages = getDamageStageState(batteryDamageN)
         end
-        dmgFrontN = saturate(dmgFront / 200.0)
-
-        -- Detect repair (damage drop)
-        if dmgFrontN < prevFrontDamage * 0.85 then
-            stageTriggered = { false, false, false, false }
-        end
-        prevFrontDamage = dmgFrontN
-
-        -- Check damage stages
+        prevBatteryDamage = batteryDamageN
         for i, stage in ipairs(damageStages) do
-            if not stageTriggered[i] and dmgFrontN >= stage.threshold then
-                -- Battery always takes some damage at each stage
+            if not batteryDamageStages[i] and batteryDamageN >= stage.threshold then
                 batteryMaxCapacity = math.clamp(batteryMaxCapacity - math.random(0, i * 10), 5.0, 100.0)
+                logDebug("Battery capacity after body damage: " .. batteryMaxCapacity)
+                batteryDamageStages[i] = true
+            end
+        end
 
-                -- Chance of alternator deterioration
+        if alternatorDamageN < prevAlternatorDamage * 0.85 then
+            alternatorDamageStages = getDamageStageState(alternatorDamageN)
+        end
+        prevAlternatorDamage = alternatorDamageN
+        for i, stage in ipairs(damageStages) do
+            if not alternatorDamageStages[i] and alternatorDamageN >= stage.threshold then
                 if math.random() < stage.probability and alternatorHealth > 0 then
                     alternatorHealth = math.clamp(alternatorHealth - stage.probability / 2, 0.0, 1.0)
+                    logDebug("Generator health after body damage: " .. alternatorHealth)
                 end
 
-                -- Chance of belt snap
                 if math.random() < stage.probability and alternatorOK then
-                    alternatorOK = false
-                    if msgQueue then
+                    local handledByAirCooling = forceAirCoolingBeltBroken and forceAirCoolingBeltBroken("Generator/fan belt has been thrown by damage")
+                    if not handledByAirCooling then
+                        alternatorOK = false
+                    end
+                    logDebug("Generator belt snapped after body damage")
+                    if msgQueue and not handledByAirCooling then
+                        msgQueue("ELECTRICITY", "The generator belt snapped from body damage!", 3)
                     end
                 end
 
-                stageTriggered[i] = true
+                alternatorDamageStages[i] = true
             end
         end
 
@@ -244,11 +335,13 @@ function updateElectricity(dt)
             end
 
             if math.random(1, fr_final) == 1 then
-                alternatorOK = false
-                if msgQueue then
-                    msgQueue("ELECTRICITY",
-                        "The alternator belt broke in the rain! FRF: " .. fr_final
-                        .. " RF: " .. rainFactor .. " RPM: " .. acCarPhysics.rpm, 3)
+                local handledByAirCooling = forceAirCoolingBeltBroken and forceAirCoolingBeltBroken("Wet fan belt has been thrown")
+                if not handledByAirCooling then
+                    alternatorOK = false
+                end
+                logDebug("Alternator belt snapped in the rain! FRF: " .. fr_final .. " RF: " .. rainFactor .. " RPM: " .. acCarPhysics.rpm)
+                if msgQueue and not handledByAirCooling then
+                    msgQueue("ELECTRICITY", "The alternator belt broke in the rain!", 3)
                 end
             end
         end
@@ -256,8 +349,13 @@ function updateElectricity(dt)
         -- Maybe that's too easy on the player. Could go from 2 to 1
         if alternatorOK and acCarPhysics.speedKmh > 1 and overrevLevel == 2 then
             if math.random(1, alternatorFailureRate) == 1 then
-                alternatorOK = false
-                if msgQueue then
+                local handledByAirCooling = forceAirCoolingBeltBroken and forceAirCoolingBeltBroken("The fan belt broke from over-revving")
+                if not handledByAirCooling then
+                    alternatorOK = false
+                end
+                logDebug("Alternator belt broke from over-revving.")
+                if msgQueue and not handledByAirCooling then
+                    msgQueue("ELECTRICITY", "The alternator belt broke from over-revving!", 3)
                 end
             end
         end
@@ -265,17 +363,18 @@ function updateElectricity(dt)
         optimizationTimerLoc = 0
     end
 
-    -- 5) ALTERNATOR OUTPUT
+    -- 5) ALTERNATOR OUTPUT (quadratic dynamo curve: weak at idle, strong at revs)
     -- Some might have better or worse alternators
     local alternatorOutput = 0
     if alternatorOK then
-        alternatorOutput = math.clamp(((acCarPhysics.rpm or 0) - 800) / 2500, 0, 1.2)
+        local rpmNorm = math.max(((acCarPhysics.rpm or 0) - alternatorOutputRpmOffset) / alternatorOutputRpmRange, 0)
+        alternatorOutput = math.clamp(rpmNorm ^ alternatorOutputExponent * alternatorOutputMaxAmps, 0, alternatorOutputMaxAmps)
         alternatorOutput = alternatorOutput * alternatorHealth * slipFactor
     end
 
     -- 6) ELECTRICAL LOADS
-    powerDrain = powerDrainSystems or 0.04
-    powerDrainHeadlights = powerDrainHeadlights or 0.4
+    powerDrain = powerDrainSystems or 0.00833
+    powerDrainHeadlights = powerDrainHeadlights or 0.01296
     -- Less drain for hybrid type (no power needed for ignition)
     if ignitionType == 3 then
         powerDrain = powerDrainSystems / 2
@@ -290,12 +389,14 @@ function updateElectricity(dt)
     end
 
     local netFlow = alternatorOutput - powerDrain
-    batteryCurrentCharge = math.clamp(batteryCurrentCharge + netFlow * dt, 0, batteryMaxCapacity)
+    local batteryPercentPerAmpSecond = 100 / (math.max(batteryCapacityAh or 12.0, 0.1) * 3600)
+    batteryCurrentCharge = math.clamp(batteryCurrentCharge + netFlow * batteryPercentPerAmpSecond * dt, 0, batteryMaxCapacity)
 
     -- Update debug snapshot
     ElecDbg.rpm              = acCarPhysics.rpm or 0
     ElecDbg.maxDamperSpeed   = maxDamperSpeed
-    ElecDbg.frontDamageN     = dmgFrontN
+    ElecDbg.batteryDamageN   = batteryDamageN
+    ElecDbg.alternatorDamageN = alternatorDamageN
     ElecDbg.temp             = temp
     ElecDbg.tempSrc          = (temp >= -20 and temp <= 200) and "W" or "O"
     ElecDbg.rainFactor       = rainFactor
@@ -326,6 +427,7 @@ function updateElectricity(dt)
             ac.setEngineRPMIdle(0)
             if (acCarPhysics.rpm or 0) > 200 then
                 ac.setEngineRPM(0)
+                logDebug("Dead Battery stalled engine. Current Charge: " .. batteryCurrentCharge)
             end
             ac.setEngineRPMLimit(math.min(ORIG_RPM_LIMIT or 7000, 1500))
             endCut()
@@ -337,6 +439,7 @@ function updateElectricity(dt)
             if batteryCutActive then
                 batteryCutTimer = batteryCutTimer - dt
                 ac.setEngineRPMIdle(0)
+                logDebug("Engine ignition cut due to weak battery. Current Charge: " .. batteryCurrentCharge)
                 if batteryCutTimer <= 0 then
                     endCut()
                     ac.setEngineRPMIdle(idleBase)
@@ -367,14 +470,16 @@ function updateElectricity(dt)
     if batteryCurrentCharge <= BAT_DEAD then
         ac.setHeadlights(false)
         -- TODO: find a way to do this for brake lights too
+        logDebug("Headlights turned off due to dead battery. Current Charge: " .. batteryCurrentCharge)
     else
         -- TODO: find a way to do this for brake lights too
     end
 
     -- Electrical gearbox ceases operation (PSG needs separate logic in its own script)
-    if (gearboxIsElectrical or false) and not (gearboxIsPSG or false) then
+    if isCotalElectricGearboxEnabled() then
         if batteryCurrentCharge <= BAT_DEAD then
             acCarPhysics.requestedGearIndex = last_engaged
+            logDebug("Cant change gears due to dead battery. Current Charge: " .. batteryCurrentCharge)
         else
             last_engaged = acCarPhysics.requestedGearIndex
         end
@@ -391,21 +496,6 @@ function updateElectricity(dt)
         acCarPhysics.controllerInputs[52] = 0
     end
 
-    -- Debug: toggle battery/alternator/belt with button press
-    if DEBUG_ELECTRICITY then
-        if carState.extraC then
-            if alternatorOK then
-                alternatorOK = false
-                alternatorHealth = 0
-                batteryCurrentCharge = 0
-            else
-                alternatorOK = true
-                alternatorHealth = 1
-                batteryCurrentCharge = 100
-            end
-        end
-    end
-
 end
 
 
@@ -415,21 +505,40 @@ function handleRepairs(dt, overheadMessageQueue_)
     local carState     = ac.getCar(0)
     msgQueue = overheadMessageQueue_
 
-    -- Roadside repair: alternator broken, car stopped, handbrake on, not in pit
-    if not alternatorOK and (acCarPhysics.speedKmh or 0) < 1
-       and ((carState.handbrake or 0) > 0.9 or isRepairingBelt)
-       and not carState.isInPit then
+    -- Roadside repair: charging belt broken, or a shared fan/charging belt is
+    -- slipping/broken. Component and battery damage remains pit-only.
+    local sharedBeltNeedsService = needsAirCoolingSharedBeltService and needsAirCoolingSharedBeltService()
+    local appRoadsideRequest = isCVRPitCrewRoadsideRepairRequested
+        and isCVRPitCrewRoadsideRepairRequested(CVR_ROADSIDE_REPAIR_ELECTRICITY)
+    if (not alternatorOK or sharedBeltNeedsService) and (acCarPhysics.speedKmh or 0) < 1
+       and ((carState.handbrake or 0) > 0.9 or isRepairingBelt or appRoadsideRequest)
+       and not carState.isInPit
+       and not tyreChangeInProgress then
 
+        if appRoadsideRequest and not cvrPitCrewRoadsideElectricityService then
+            cvrPitCrewRoadsideElectricityService = true
+            if beginCVRPitCrewRoadsideService then
+                beginCVRPitCrewRoadsideService()
+            end
+        end
         isRepairingBelt = true
+        acCarPhysics.gas = 0
+        acCarPhysics.brake = 1
+        acCarPhysics.handbrake = 1
+        ac.setEngineRPM(0)
         acCarPhysics.controllerInputs[52] = 1
         beltRepairTimer = (beltRepairTimer or 0) + dt
 
         local pct = math.floor((beltRepairTimer / alternatorRepairTime) * 100)
+        local beltName = sharedBeltNeedsService and "fan/charging belt" or "charging belt"
         msgQueue("ELECTRICITY",
-            "Fitting a new alternator belt: " .. string.format("%d%%", pct) .. " done", 1, true)
+            "Fitting a new " .. beltName .. ": " .. string.format("%d%%", pct) .. " done", 1, true)
 
         if beltRepairTimer >= alternatorRepairTime then
             alternatorOK = true
+            if repairAirCoolingSharedBelt then
+                repairAirCoolingSharedBelt()
+            end
             -- Not sure if this should really be here; but sounds reasonable that
             -- the driver would attempt some alternator repair while changing the belt
             alternatorHealth = math.min((alternatorHealth or 0) + 0.5, 1.0)
@@ -437,11 +546,23 @@ function handleRepairs(dt, overheadMessageQueue_)
             isRepairingBelt = false
             acCarPhysics.controllerInputs[52] = 0
             alternatorRepairTime = math.random(100, 200)
+            if cvrPitCrewRoadsideElectricityService then
+                cvrPitCrewRoadsideElectricityService = false
+                if completeCVRPitCrewRoadsideRepairService then
+                    completeCVRPitCrewRoadsideRepairService(CVR_ROADSIDE_REPAIR_ELECTRICITY)
+                end
+            end
         end
 
     elseif isRepairingBelt and (acCarPhysics.speedKmh or 0) > 2 then
         isRepairingBelt = false
         acCarPhysics.controllerInputs[52] = 0
         beltRepairTimer = 0
+        if cvrPitCrewRoadsideElectricityService then
+            cvrPitCrewRoadsideElectricityService = false
+            if cancelCVRPitCrewRoadsideService then
+                cancelCVRPitCrewRoadsideService()
+            end
+        end
     end
 end
