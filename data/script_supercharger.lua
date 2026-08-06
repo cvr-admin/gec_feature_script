@@ -5,7 +5,7 @@
 -- When the boost is above the defined limit, the failure rate is decreased (increasing the probability).
 -- See the parameters in the car_parameters.lua.
 
-require "car_parameters"
+require "script_car_parameters"
 
 local acRef = nil
 local car = nil

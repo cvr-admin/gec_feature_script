@@ -1,12 +1,25 @@
---[[Historic feature script for interwar cars by 
--kapasaki
--DimitriHarkov
--SLIGHTLYMADESTUDIOS / Tunari
--Garamond247
+--Historic damage script by SLIGHTLYMADESTUDIOS
+--youregoingtobrazil.eu - tunarisgame.com
+--description:
+--big ups to Garamond247 for commissioning!
+--add gobs of simulation value to your historics, including:
 
-add gobs of simulation value to your historics
+--random fuel pump damage
+--random oil pressure problems
+--random valve damage
+--basic radiator damage
+--basic coolant temp sim
+--random spark plug failure
+--random gear loss
+--brake wear
+--starter/stall system
+--random tyre durability
+--on-road tyre service
+--spares, configurable carry-on spares wheels
+--a basic message queue system to inform driver of instrument statuses
+--slow tyre puncture
 
-Failure Probability (2h Race and 24h race)
+--[[ Failure Probability (2h Race and 24h race)
 6666.7 ~41.74%
 10000 ~30.12%
 15000 ~21.34%
@@ -30,34 +43,49 @@ Failure Probability (2h Race and 24h race)
 50,000 + 42,000 = 14.61%
 ]]
 
-local VERSION = "2.6.1"
+local VERSION = "3.3"
 
-local acCarPhysics = ac.accessCarPhysics() --extension physics shortcut
-
-if acCarPhysics.inputMethod == ac.InputMethod.AI then
-    --absolutely do not execute any of this on an AI car, who knows how badly it fucks up.
-    --you can maybe make a "lite" version of this that only runs the sparkplug routine, but aside from that, all of this is way too advance for AI to understand
-    return
-end
+acCarPhysics = ac.accessCarPhysics() --extension physics shortcut
 
 --READ ONLY
 
-thisCar = ac.getCar()
+thisCar = car or ac.getCar()
 
-require "car_parameters"
-require "supercharger"
-require "failure_rate_handling"
-require "electricity"
-require "script_psg"
+require "script_car_parameters"
 
--- Uncomment line below to enable the switch throttle model. Make sure to also get copy the script_switch_throttle_model.lua file and paste its content into this file.
---local switch_throttle_model = require("script_switch_throttle_model")
+local isAICar = acCarPhysics.inputMethod == ac.InputMethod.AI
+
+if isAICar then
+    -- AI gets a lightweight reliability layer only. The full human damage script
+    -- is too input-heavy and repair-menu dependent for computer-controlled cars.
+    require "script_ai_failures"
+    initAIFailureSystem(acCarPhysics, thisCar)
+end
+
+local new_throttle_model = nil
+local rescue = nil
+
+if not isAICar then
+    require "script_supercharger"
+    require "script_failure_rate_handling"
+    require "script_electricity"
+    require "script_psg"
+
+    new_throttle_model = require("script_throttle")
+    rescue = require("script_rescue_push")
+    rescue.init(acCarPhysics)
+end
 
 -- Enable/disable debug prints and test code.
 -- *** Must always be false in release packages! ***
-local DEBUG = true
+local DEBUG = false
 local DEBUG_LOG_FILE = true  -- Left logging enabled for release 2.0.
-local TEST_CODE = true
+local TEST_CODE = false
+-- Extra T: cycles/selects the test failure type. Extra S: triggers the currently selected failure.
+
+if setElectricityDebugEnabled then
+    setElectricityDebugEnabled(DEBUG)
+end
 
 -- Override can be used to temporarily ignore the DEBUG flag,
 -- if you want to print only certain debug data, but not all.
@@ -67,16 +95,6 @@ function printDebug(str1, str2, override)
         ac.debug(str1, str2)
     end
 end
-
-local tyrePunctureRates = {}
-
-local function initTyrePunctureRates()
-    for i = 0, 3 do
-        tyrePunctureRates[i] = 0.0
-    end
-end
-
-initTyrePunctureRates()
 
 -- Log debug messages to the csp log file. Append 'true' as the last argument
 -- to force logging regardless of the DEBUG_LOG_FILE flag.
@@ -98,69 +116,55 @@ function logDebug(...)
     end
 end
 
-local debugPrevExtraA = false
-local debugPrevExtraB = false
-local debugPrevExtraC = false
-local debugPrevExtraD = false
-local debugPrevExtraE = false
-local debugPrevExtraF = false
-local debugPrevInPits = false
-local debugPrevHandbrake = false
+-- New subsystem modules. Order matters: overhead_messages first so overheadMessageQueue
+-- is available to all modules that follow. All placed after printDebug/logDebug so
+-- module-load-time code can call them safely.
+if not isAICar then
+    require "script_overhead_messages"
+    require "script_engine_failures"
+    require "script_gearbox"
+    require "script_dogbox"
+    require "script_tyre"
+    require "script_thermal"
+    require "script_air_cooling"
+    require "script_engine_starter"
+    require "script_fuel"
+    require "script_oil"
+    require "script_brakes"
+    -- script_debug is required later (after failure rate vars are initialised below).
+end
 
 local doOnceAtStart = false
 
-initTurboVariables(ac, printDebug, logDebug)
+if not isAICar then
+    initTurboVariables(ac, printDebug, logDebug)
+    initFailureHandlingVariables(printDebug, logDebug)
+end
 
 local superchargerExists = 0
-if getTurboCount() > 0 then
+if not isAICar and getTurboCount() > 0 then
     superchargerExists = 1
 end
 
 local turboFailureTimer = 0
-local currentEngineHeatGainMult = engineHeatGainMult
+currentEngineHeatGainMult = engineHeatGainMult
 local prevFailedTurboCount = 0
 local turboSmokeDuration = 25
 local turboSmokeTimer = turboSmokeDuration
 
-local deadGears = {} --dead gears, boolean array
-
--- Initialize deadGears array - index 1 for 1st gear, etc.
-local function initDeadGears()
-    for i = 1, thisCar.gearCount do
-        deadGears[i] = false
-    end
-end
-
-initDeadGears()
-
-local function initTyrePunctureTables()
-    for i = 0, 3 do
-        tyrePunctureDeflateFactor[i] = 0.0
-        tyrePuncturePressureFactor[i] = 0.0
-    end
-end
-
-initTyrePunctureTables()
-
-local tyreWear = {}
-local prevTyreWear = {}
-
-local function initTyreWearTable()
-    for i = 0, 3 do
-        tyreWear[i] = 0.0
-        prevTyreWear[i] = 0.0
-    end
-end
-
-initTyreWearTable()
-
-local roadsideTyreChange = 0
-
-local carHasTeleportedToPits = false
-
 -- Teleport to pits callback. Will be called when the car is teleported to pits.
 -- When this happens we will prevent starting of the engine, thus ending the race
 -- for the car that was teleported to pits.
+carHasTeleportedToPits = false
+local lastCarWorldPosition = nil
+
+local function updateLastCarWorldPosition()
+    local position = thisCar.position
+    if position then
+        lastCarWorldPosition = vec3(position.x, position.y, position.z)
+    end
+end
+
 function teleportToPitsCallback(carIndex)
     printDebug("Car teleported to pits", "Car index: " .. carIndex)
     printDebug("This car index", "Car index: " .. thisCar.index)
@@ -169,67 +173,39 @@ function teleportToPitsCallback(carIndex)
     if raceStarted and thisCar.isInPit then
         carHasTeleportedToPits = true
     end
+
+    if carIndex == thisCar.index and thisCar.isInPit then
+        local keepRaceTeleportLockout = carHasTeleportedToPits
+        local jumpDistance = lastCarWorldPosition and thisCar.position
+            and vec3.distance(lastCarWorldPosition, thisCar.position) or 0
+        -- CSP also uses this callback for an in-place pit state refresh. A real
+        -- return-to-pits jump moves the car to its box and must reset everything.
+        resetCar(jumpDistance > 5)
+        updateLastCarWorldPosition()
+        carHasTeleportedToPits = keepRaceTeleportLockout
+    end
 end
 
 ac.onCarJumped(thisCar.index, teleportToPitsCallback)
 
 local optimizationTimer = 0 --run a small timer rather than running some of the checks every tick. should save on CPU.
-local coolantTemp = 70 --store our own water temp, since the AC one is arbitrary and read-only.
-local engineTemp = 70 --engine core temp - once this hits the meltdown value its OVER.
-local airAmbientTemp = ac.getSim().ambientTemperature --get the ambient air temp, it will affect the coolant temperature cool factor
-local radiatorSetup = 0 -- get this when exiting pits
+
+local radiatorSetup = nil   -- handled by setupBits now
 local prevRadiatorSetup = 0
 local turboEnabled = true
 local prevextraDState = false
 local prevextraEState = false
 local prevextraFState = false
-local currentSpares = 2 -- get this when exiting pits
-local carStoppedTimer = 0 --the timer to check if car is stopped for a tyre replacement
-local tyreChangeInProgress = false --is the car changing a tyre
-local tyrePressures = {} --store the original tyre pressures here (do it when exiting pits)
-local tyrevKMs = {} --store the tyre vKMs here
-local sparkPlugFailed = false
-local fuelPumpFailed = false
-local valveFailed = false
-local oilPressureFailed = false
-local gearboxDamageValue = thisCar.gearboxDamage
-local brakesFailed = false
-local hasRadiatorDamage = false
-local hasRadiatorMajorDamage = false
-local totalMeltdown = false
-local waterTempWarning = false
-local oilPressureWarning = false
-local oilPressureWarning2 = false
-local valveWarning = false
-local engineLife = thisCar.engineLifeLeft
-local tyreStockEmpty = false
-
-local queuedOverheadNotifs = {} --queue'd system messages. contains tables. (structs)
-local overheadMessagesEnabled = true --overhead messages enabled through setup menu
-
-local mediumSpeedDtTimer = 0
-local tyreBlowCrashingTimer = 0
-
-local prevDamageFront = thisCar.damage[0]
-local prevDamageRear = thisCar.damage[1]
-local prevDamageLeft = thisCar.damage[2]
-local prevDamageRight = thisCar.damage[3]
-
-initFailureHandlingVariables(printDebug, logDebug)
-
-local sparkPlugFailureRate = sparkPlugFailureRateInitialValue
-local sparkPlugFailureRateBase = sparkPlugFailureRateInitialValue
-local fuelPumpFailureRate = fuelPumpFailureRateInitialValue
-local fuelPumpFailureRateBase = fuelPumpFailureRateInitialValue
-local valveFailureRate = valveFailureRateInitialValue
-local valveFailureRateBase = valveFailureRateInitialValue
-local oilPressureFailureRate = oilPressureFailureRateInitialValue
-local oilPressureFailureRateBase = oilPressureFailureRateInitialValue
-
-local radiatorCoolCoefficient = radiatorCoolCoefficientInitialValue
-local radiatorCoolCoefficientBase = radiatorCoolCoefficientInitialValue
+local pitWaterCoolingApplied = false
 
 local hasEngineDamage = false
+local prevEngineLifeForCrashFire = 1000
+local prevCrashFireDamageFront = 0
+local prevCrashFireDamageRear = 0
+local prevCrashFireDamageLeft = 0
+local prevCrashFireDamageRight = 0
+local engineCrashFireTimer = 0
+local engineCrashFireIntensity = 0
 
 local ENGINE_MAP_RICH = 0
 local ENGINE_MAP_NORMAL = 1
@@ -237,911 +213,191 @@ local ENGINE_MAP_LEAN = 2
 local ENGINE_MAP_PUSH = 3
 local EGINE_MAP_DESCRIPTIONS = { "Rich", "Normal", "Lean", "Push" }
 
+-- Failure rates. Base rates are global so that failure_rate_handling and script_debug can access them.
+-- The actual (engine-map-adjusted) rates are also global so that the failure functions can read them.
+sparkPlugFailureRate = sparkPlugFailureRateInitialValue
+sparkPlugFailureRateBase = sparkPlugFailureRateInitialValue
+fuelPumpFailureRate = fuelPumpFailureRateInitialValue
+fuelPumpFailureRateBase = fuelPumpFailureRateInitialValue
+valveFailureRate = valveFailureRateInitialValue
+valveFailureRateBase = valveFailureRateInitialValue
+oilPressureFailureRate = oilPressureFailureRateInitialValue
+oilPressureFailureRateBase = oilPressureFailureRateInitialValue
+remFlags = remFlags or {}
+
 local prevEngineMap = -1
 local prevLapCount = 0
 
 local failureRateHandlingTimer = 0
 local failureRateHandlingInterval = 0.3
 
-local trackSurfaceType = ac.SurfaceExtendedType.Base
+trackSurfaceType = ac.SurfaceExtendedType.Base
 
-local isCarInPits = false
+local mediumSpeedDtTimer = 0
+local tyreBlowCrashingTimer = 0
 
-local maxDistanceBetweenTyreStacks = 1000
-local tyreStacksPerLap = math.max(math.ceil(ac.getSim().trackLengthM / maxDistanceBetweenTyreStacks) - 1, 2)
-local tyreStacksPositions = {}
-
-local normalFuelConsumptionRate = acCarPhysics.fuelConsumption
-local fuelLeakageDamage = false
-
--- Variables for limiting engine damage at gentle crashes on the sides.
-local bodyDamageLimitAtCrashEngine = 20
-local prevDamageFrontEngine = 0
-local prevDamageRearEngine = 0
-local prevDamageLeftEngine = 0
-local prevDamageRightEngine = 0
-local currentEngineLifeLeft = acCarPhysics.engineLifeLeft
-
-
-local tyreReplacementTime = ac.INIConfig.carData(0, 'car.ini'):get('PIT_STOP', 'TYRE_CHANGE_TIME_SEC', 55)
-
-local function initTyreStacksPositions()
-    local trackLength = ac.getSim().trackLengthM
-    for i = 0, tyreStacksPerLap - 1 do
-        local position = (i * trackLength) / tyreStacksPerLap
-        table.insert(tyreStacksPositions, position)
-    end
-
-    -- Insert the track length at the end to complete the loop.
-    table.insert(tyreStacksPositions, trackLength)
-
-    printDebug("tyreStacksPositions", tyreStacksPositions)
-    printDebug("Tyre stack count", tyreStacksPerLap)
+local function resetEngineCrashFire()
+    prevEngineLifeForCrashFire = acCarPhysics.engineLifeLeft or 1000
+    prevCrashFireDamageFront = thisCar.damage[0] or 0
+    prevCrashFireDamageRear = thisCar.damage[1] or 0
+    prevCrashFireDamageLeft = thisCar.damage[2] or 0
+    prevCrashFireDamageRight = thisCar.damage[3] or 0
+    engineCrashFireTimer = 0
+    engineCrashFireIntensity = 0
 end
 
-initTyreStacksPositions()
-
-if TEST_CODE then
-    local tyrePunctureTestIndex = -1
-end
-
-local function overheadMessageQueue(head, description, displayTime, override)
-    --put data into a table since LUA dont got no stucts (GOOD LANGUAGE VITTU!)
-    override = override or false
-
-    if override == true and #queuedOverheadNotifs > 0 then
-        queuedOverheadNotifs[1].time = 0
-    end
-
-    sneed = {
-    topText = head,
-    bottomText = description,
-    time = displayTime,
-    }
-    table.insert(queuedOverheadNotifs, sneed)
-end
-
-local function overheadMessageDisplay(dt)
-    if overheadMessagesEnabled then
-
-        if queuedOverheadNotifs[1] ~= nil then
-            queuedOverheadNotifs[1]["time"] = queuedOverheadNotifs[1]["time"] - dt
-            ac.setSystemMessage(queuedOverheadNotifs[1]["topText"], queuedOverheadNotifs[1]["bottomText"])
-            if queuedOverheadNotifs[1]["time"] < 0 then
-                table.remove(queuedOverheadNotifs, 1)
-            end
-        end
-    end
-end
-
--- AC uses 1=neutral, 2=1st gear, etc.
-local function getCurrentGearIndex()
-    return acCarPhysics.gear - 1
-end
-
--- Function to adjust gear failure rate dynamically
-local function updateGearFailureRate(gearboxDamageValue)
-    -- Ensure gearboxDamage is within valid range (0 to 1)
-    gearboxDamageValue = math.clamp(gearboxDamageValue, 0, 1)
-
-    if gearboxDamageValue > 0.5 then
-        boostedGearFailureRate = gearFailureRate / 3  -- Increase failure chance
-    else
-        boostedGearFailureRate = gearFailureRate  -- Reset to base rate
-    end
-end
-
-local function getRandomStartTime() return math.random(1, 5) end
-local function getFluctuatingRPM() return math.random(300, 700) end
-
-local timeToStart = getRandomStartTime()
-
-local carState = { ignition = false, cranking = false, crankTimer = 0, stalling = false, stallRPM = 0 }
-local carInfo = {
-    idleRPM = ac.INIConfig.carData(0, 'engine.ini'):get('ENGINE_DATA', 'MINIMUM', engineIdleRpm),
-    starterRPM = engineIdleRpm + 700
-}
-
-ac.setEngineStalling(true)
-local starterTorque = 40.0
-ac.setEngineStarterTorque(0)
-
-local function applyLag(current, target, factor, dt)
-    return current + (target - current) * factor * dt
-end
-
-local function lerp(a, b, t) return a + (b - a) * t end
-
-local function getWearMultiplier(rpmFactor)
-    for i = 1, #wearLUT - 1 do
-        if rpmFactor >= wearLUT[i][1] and rpmFactor <= wearLUT[i+1][1] then
-            local t = (rpmFactor - wearLUT[i][1]) / (wearLUT[i+1][1] - wearLUT[i][1])
-            return lerp(wearLUT[i][2], wearLUT[i+1][2], t)
-        end
-    end
-    return wearLUT[#wearLUT][2]
-end
-
-local teleportPrevExtraA = false
-
-local function engineStaller(dt)
-    -- engine stalling / ignition functions
-    local inputs = { ignition = car.extraA, clutch = acCarPhysics.clutch }
-    local fixingOngoing = fuelPumpRepairInProgress or gearboxRepairInProgress
-
-    if car.extraA and carHasTeleportedToPits then
-        if car.extraA and not teleportPrevExtraA then
-            overheadMessageQueue("START DISABLED", "You have teleported to the pits, race restart is not allowed", 3)
-        end
-        inputs.ignition = false
-    end
-    teleportPrevExtraA = car.extraA
-
-    -- Cranking Logic
-    if inputs.ignition and not carState.ignition and not fixingOngoing then
-        carState.cranking = true
-        carState.crankTimer = carState.crankTimer + dt
-        ac.setEngineStarterTorque(starterTorque)
-
-        -- push start simulation: add ~10-12 secs to timeToStart - also add hand crank penalty if not in the pits or on the grid
-        -- Electro starter or on grid/in pits: as it was. Crank start elsewhere: a little bit longer. Push start for stalled hybrids out in the wild: much longer.
-        
-        local pushStartTimer = 0
-        local onGrid = (ac.getSim().raceSessionType == ac.SessionType.Race and not ac.getSim().isSessionStarted)
-        if not onGrid and not (thisCar.isInPitlane and thisCar.isInPit) then    -- fast starts if on grid and in pits - will have human or mechanical help there
-            if ignitionType == 3 then       -- push start for stalled hybrids with flat battery
-                if (acCarPhysics.controllerInputs[44] or 1) <= 0.05 then
-                    pushStartTimer = math.random(8,12)
-                    overheadMessageQueue("PUSH STARTING", "...because the battery is empty. This may take a good while longer.", 1, true)
-                end
-            end
-            if (ignitionType or 1) < 2 then       -- crank start for stalled magneto or undefined types
-                    pushStartTimer = math.random(4,6)
-                    overheadMessageQueue("CRANK STARTING", "This may take a bit longer.", 1, true)
-            end
-        end
-
-
-        if carState.crankTimer < (timeToStart + pushStartTimer) then
-            -- Simulate fluctuating RPM between 400 and 600
-            ac.setEngineRPM(getFluctuatingRPM())
-        else
-            -- Set RPM to starterRPM when timeToStart is reached
-            ac.setEngineRPM(carInfo.starterRPM)
-            carState.ignition = true
-            carState.cranking = false
-            ac.setEngineStarterTorque(0)
-        end
-    else
-        carState.cranking = false
-        carState.crankTimer = 0
-    end
-
-    printDebug("Ignition Time", timeToStart)
-
-    -- Running and Stalling Logic
-    if carState.ignition then
-        if acCarPhysics.rpm < carInfo.idleRPM * 0.9 then -- Adjusted threshold to avoid premature stalling
-            carState.ignition = false
-            carState.stalling = true
-            carState.stallRPM = acCarPhysics.rpm
-        else
-            -- Stabilize idle RPM
-            acCarPhysics.rpm = math.max(acCarPhysics.rpm, carInfo.idleRPM)
-        end
-    elseif carState.stalling then
-        carState.stallRPM = applyLag(carState.stallRPM, 0, 2.0, dt)
-        ac.setEngineRPM(carState.stallRPM)
-        if carState.stallRPM < 10 then
-            carState.stalling = false
-            timeToStart = getRandomStartTime()
-        end
-    else
-        if not carState.cranking then ac.setEngineRPM(0) end
-    end
-
-    acCarPhysics.controllerInputs[5] = carInfo.idleRPM
-    acCarPhysics.controllerInputs[6] = acCarPhysics.rpm
-
--- engine stalling / ignition functions end
-end
-
-local function brakeWear(dt)
-    -- BRAKE WEAR STUFF START
-    local totalWear = 0
-    local brakeInput = acCarPhysics.brake
-
-    -- Calculate wear for each wheel
-    for i = 0, 3 do
-        local wheel = acCarPhysics.wheels[i]
-
-        -- Convert angular velocity (rad/s) to RPM
-        local wheelRPM = math.abs(wheel.angularSpeed) * 60 / (2 * math.pi)
-        local rpmFactor = wheelRPM / maxBrakeRPM
-
-        -- Calculate effective brake torque (simplified model)
-        local brakeTorque = brakeInput * maxBrakeTorque
-
-        local wearMult = getWearMultiplier(rpmFactor)
-
-        -- Combine factors for wear calculation
-        local wheelWear = wearMult * brakeInput * brakeTorque * baseWearRate
-        totalWear = totalWear + wheelWear * dt
-    end
-
-    brakeWearLevel = math.min(brakeWearLevel + totalWear, 1000)
-
-    -- Calculate brake fade with smooth interpolation
-    local brakeFade = 0.0
-    if brakeWearLevel > brakeFadeStart then
-        local fadeT = (brakeWearLevel - brakeFadeStart) / (1000 - brakeFadeStart)
-        brakeFade = fadeT * maxBrakeFade
-    end
-
-    -- Apply fade to brakes while preserving ABS functionality
-    acCarPhysics.brake = acCarPhysics.brake * (1 - brakeFade)
-
-    -- Debug output
-    printDebug("Brake Wear", string.format("Total: %.1f/%d | Fade: %.1f%%", brakeWearLevel, brakeFadeStart, brakeFade * 100))
-    printDebug("Brake Wear Factors", string.format("Rate: %.2f/s | Input: %.2f", totalWear/dt, brakeInput))
-    acCarPhysics.controllerInputs[11] = brakeFade
-    -- BRAKE WEAR STUFF END
-end
-
---spark plug failure
---simply, if you roll unlucky, you get slapped with random engine damage between certain values.
---if you already have more damage, its skipped.
-local function sparkPlugFailure()
-    if sparkPlugFailed == false then
-        if math.random(1, sparkPlugFailureRate) == 1 then
-            sparkPlugFailed = true
-            if acCarPhysics.engineLifeLeft > sparkPlugFailureDamage then
-                ac.setEngineLifeLeft(sparkPlugFailureDamage)
-                -- recalculate spark plug failure amount
-                --math.randomseed(os.time() + math.random(0, 10000))
-                sparkPlugFailureDamage = math.random(200, 600)
-                overheadMessageQueue("Spark plug failure", "You may experience engine cut-offs and power loss", 10)
-                -- audioQueue("sparkplugFailure")
-                logDebug("<FLR>Spark Plug Fail, rate: ", sparkPlugFailureRate, true)
-            end
-        end
-    end
-    printDebug("Spark Plug Failure", string.format("Status: %s | Amount: %.2f", tostring(sparkPlugFailed), sparkPlugFailureDamage))
-
-end --end of spark plug failure
-
--- Add with other variables at the top
-local fuelPumpFailureCooldown = 0
-local fuelPumpFailureDuration = 0
-local fuelPumpCutoffActive = false
-
-local function fuelPumpFailureActivation()
-    -- Only check for activation if not already failed
-    if not fuelPumpFailed then
-        -- Roll for failure (every 2 seconds)
-        if math.random(1, fuelPumpFailureRate) == 1 then
-            fuelPumpFailed = true
-            fuelPumpFailureDuration = math.random(1, 3)
-            fuelPumpFailureCooldown = math.random(4, 7)
-            overheadMessageQueue("Fuel Pump Failure", "Fuel flow disrupted!", 5)
-            printDebug("Fuel Pump", "Failure activated!")
-            logDebug("<FLR>Fuel Pump Fail, rate: ", fuelPumpFailureRate, true)
-        end
-    end
-end
-
-local function fuelPumpFailure(dt)
-    -- Only process if failed state is active
-    if not fuelPumpFailed then return end
-
-    -- Failure behavior system (runs every tick)
-    if fuelPumpCutoffActive then
-        -- Active cutoff phase
-        fuelPumpFailureDuration = fuelPumpFailureDuration - dt
-        acCarPhysics.gas = 0  -- Hard throttle cutoff
-        if fuelPumpFailureDuration <= 0 then
-            fuelPumpCutoffActive = false
-        end
-    else
-        -- Cooldown phase
-        fuelPumpFailureCooldown = fuelPumpFailureCooldown - dt
-
-        if fuelPumpFailureCooldown <= 0 then
-            fuelPumpCutoffActive = true
-            fuelPumpFailureDuration = math.random(1, 3)
-            fuelPumpFailureCooldown = math.random(4, 7)
-        end
-    end
-
-    -- Optional debug
-    printDebug("Fuel Pump Behavior", string.format(
-        "Cutoff: %s | Duration: %.1f | Cooldown: %.1f",
-        tostring(fuelPumpCutoffActive),
-        fuelPumpFailureDuration,
-        fuelPumpFailureCooldown
-    ))
-end --end of fuel pump failure
-
---valve failure
---simply, if you roll unlucky, you get slapped with random engine damage between certain values.
---if you already have more damage, its skipped.
--- Valve Failure Parameters
-valveFailureMinDamage = engineLife
--- Initialize
-valveFailureDamage = valveFailureMinDamage
-
-local function valveFailure(dt)
-    if not valveFailed then
-        if math.random(1, valveFailureRate) == 1 then
-            valveFailureActive = true
-            valveFailed = true
-            overheadMessageQueue("Valve problems", "Early stage valve issues detected", 5)
-            logDebug("<FLR>Valve Fail, rate: ", valveFailureRate, true)
-        end
+local function updateEngineCrashFire(dt)
+    if not engineCrashFireEnabled then
+        acCarPhysics.controllerInputs[80] = 0
+        acCarPhysics.controllerInputs[81] = 0
+        acCarPhysics.controllerInputs[82] = 0
         return
     end
 
-    if valveFailureActive then
-        -- RPM-based progression control
-        if acCarPhysics.rpm > 0 and not totalMeltdown then
-            valveFailureMinDamage = acCarPhysics.engineLifeLeft
-            -- Calculate RPM factor (0-2.0 range)
-            local rpmFactor = math.clamp(acCarPhysics.rpm / valveReferenceRPM, 0.1, 2.0)
+    local damageFront = thisCar.damage[0] or 0
+    local damageRear = thisCar.damage[1] or 0
+    local damageLeft = thisCar.damage[2] or 0
+    local damageRight = thisCar.damage[3] or 0
+    local directEngineDamageDelta = math.max(
+        damageFront - prevCrashFireDamageFront,
+        damageRear - prevCrashFireDamageRear,
+        0)
+    local speedKmh = math.max(acCarPhysics.speedKmh or 0, thisCar.speedKmh or 0)
+    local engineLife = acCarPhysics.engineLifeLeft or 1000
 
-            -- Effective time accumulation
-            valveFailureElapsed = valveFailureElapsed + (dt * rpmFactor)
-
-            -- Calculate progression (0-1)
-            local progression = math.clamp(valveFailureElapsed / valveFailureBaseTime, 0, 1)
-
-            -- Non-linear damage curve
-            local damageProgression = progression^1.3  -- Faster initial degradation
-            valveFailureDamage = math.lerp(valveFailureMinDamage, valveFailureMaxDamage, damageProgression)
-
-            -- Apply damage if engine still has life
-            if acCarPhysics.engineLifeLeft > valveFailureDamage then
-                ac.setEngineLifeLeft(valveFailureDamage)
-            end
-
-            -- Progressive warnings
-            if progression > 0.8 and not valveWarning then
-                overheadMessageQueue("CRITICAL VALVE FAILURE", "Immediate pit stop required!", 10)
-                valveWarning = true
-            elseif progression > 0.5 then
-                overheadMessageQueue("Severe valve damage", "Power loss increasing significantly", 5)
-            end
-
-            -- Final failure state
-            if progression >= 1.0 then
-                valveFailureActive = false
-                ac.setEngineLifeLeft(valveFailureMaxDamage)
-                overheadMessageQueue("Total Valve Failure", "Engine no longer operational", 0)
-            end
-        else
-            -- Pause progression when engine is off/stalled
-            overheadMessageQueue("Valve Damage Halted", "Engine shutdown paused deterioration", 2)
-        end
+    if engineCrashFireTimer <= 0
+            and prevEngineLifeForCrashFire > engineCrashFireEngineLifeThreshold
+            and engineLife <= engineCrashFireEngineLifeThreshold
+            and directEngineDamageDelta >= engineCrashFireDamageDeltaThreshold
+            and speedKmh >= engineCrashFireMinimumSpeedKmh then
+        local severity = math.clamp(
+            (directEngineDamageDelta - engineCrashFireDamageDeltaThreshold) /
+            math.max(100 - engineCrashFireDamageDeltaThreshold, 1),
+            0,
+            1)
+        engineCrashFireTimer = engineCrashFireDurationSeconds
+        engineCrashFireIntensity = engineCrashFireIntensityMin +
+            (engineCrashFireIntensityMax - engineCrashFireIntensityMin) * severity
+        overheadMessageQueue("Engine fire", "Hard impact has ignited the engine bay", 5)
     end
 
-end --end of valve failure
-
---oil pressure failure
---simply, if you roll unlucky, you get slapped with random engine damage between certain values.
---if you already have more damage, its skipped.
---oil pressure failure parameters
-oilPressureMinDamage = engineLife
--- Initialize
-oilPressureFailureDamage = oilPressureFailureMinDamage
-
-local function oilPressureFailure(dt)
-    if not oilPressureFailed then
-        if math.random(1, oilPressureFailureRate) == 1 then
-            oilPressureFailureActive = true
-            oilPressureFailed = true
-            overheadMessageQueue("Oil pressure problems", "Early stage oil pressure issues detected", 5)
-            logDebug("<FLR>Oil Pressure Fail, rate: ", oilPressureFailureRate, true)
-        end
-        return
+    if engineCrashFireTimer > 0 then
+        engineCrashFireTimer = math.max(0, engineCrashFireTimer - dt)
     end
 
-    if oilPressureFailureActive then
-        -- RPM-based progression control
-        if acCarPhysics.rpm > 0 and not totalMeltdown then
-            oilPressureFailureMinDamage = acCarPhysics.engineLifeLeft
-            -- Calculate RPM factor (0-2.0 range)
-            local oilPressurerpmFactor = math.clamp(acCarPhysics.rpm / oilPressureReferenceRPM, 0.1, 2.0)
+    acCarPhysics.controllerInputs[80] = engineCrashFireTimer > 0 and 1 or 0
+    acCarPhysics.controllerInputs[81] = engineCrashFireTimer > 0 and engineCrashFireIntensity or 0
+    acCarPhysics.controllerInputs[82] = engineCrashFireTimer > 0 and
+        math.clamp(engineCrashFireTimer / math.max(engineCrashFireDurationSeconds, 0.001), 0, 1) or 0
 
-            -- Effective time accumulation
-            oilPressureFailureElapsed = oilPressureFailureElapsed + (dt * oilPressurerpmFactor)
-
-            -- Calculate progression (0-1)
-            local oilPressureProgression = math.clamp(oilPressureFailureElapsed / oilPressureFailureBaseTime, 0, 1)
-
-            -- Non-linear damage curve
-            local oilPressureDamageProgression = oilPressureProgression^1.3  -- Faster initial degradation
-            oilPressureFailureDamage = math.lerp(oilPressureFailureMinDamage, oilPressureFailureMaxDamage, oilPressureDamageProgression)
-
-            -- Apply damage if engine still has life
-            if acCarPhysics.engineLifeLeft > oilPressureFailureDamage then
-                ac.setEngineLifeLeft(oilPressureFailureDamage)
-            end
-
-            -- Progressive warnings
-            if oilPressureProgression > 0.8 and not oilPressureWarning then
-                overheadMessageQueue("CRITICAL OIL PRESSURE", "Immediate pit stop required!", 10)
-                oilPressureWarning = true
-            elseif oilPressureProgression > 0.5 and not oilPressureWarning2 then
-                overheadMessageQueue("Really low oil pressure", "Power loss and engine overheating increasing significantly", 5)
-                oilPressureWarning2 = true
-            end
-
-            -- Final failure state
-            if oilPressureProgression >= 1.0 then
-                oilPressureFailureActive = false
-                ac.setEngineLifeLeft(oilPressureFailureMaxDamage)
-                overheadMessageQueue("Total oil pressure issue", "Engine no longer operational", 0)
-            end
-        else
-            -- Pause progression when engine is off/stalled
-            overheadMessageQueue("Engine stalled", "Cooling down", 2)
-        end
-    end
-
-end --end of oil pressure failure
-
-local function gearboxFailure()
-    local currentGearIndex = getCurrentGearIndex()
-    if currentGearIndex > 0 and math.random(1, boostedGearFailureRate) == 1 then
-        deadGears[currentGearIndex] = true  -- Mark gear as dead
-        overheadMessageQueue("GEAR FAILURE", "Gear "..(currentGearIndex).." has failed!", 5)
-        logDebug("<FLR>Gear Fail, gear: ", currentGearIndex, ", rate: ", boostedGearFailureRate, true)
-    end
+    prevEngineLifeForCrashFire = engineLife
+    prevCrashFireDamageFront = damageFront
+    prevCrashFireDamageRear = damageRear
+    prevCrashFireDamageLeft = damageLeft
+    prevCrashFireDamageRight = damageRight
 end
 
-local function isAnyGearBroken()
-    for i = 1, thisCar.gearCount do
-        if deadGears[i] then
-            return true
-        end
-    end
-    return false
+-- call once so current setup is applied on load - this did not work because AC's logic on that matter is weird. Now handled in setupBits
+--applyRadiatorSetup(radiatorSetup)
+
+-- script_debug required here so that its module-level code runs after all vars above are set.
+if not isAICar then
+    require "script_debug"
 end
 
-local function debugTyrevKMs()
-    for i = 0, 3 do
-        printDebug("tyrevKM_" .. i, tyrevKMs[i])
-    end
+-- Initialise failure type counter for test code (captures orig failure rate values).
+-- AI cars do not load script_debug.lua, where initFailureTypeCount() is defined.
+if TEST_CODE and not isAICar then
+    initFailureTypeCount()
 end
-
-local function getWheelName(tyreIndex)
-    wheelNames = {"Front left", "Front right", "Rear left", "Rear right"}
-    return wheelNames[tyreIndex + 1]
-end
-
-local function generateSlowPuncture(tyreIndex, minFactor, maxFactor)
-    -- Generate a factor to use deflating the tyre, defining the speed of deflation.
-    -- This value will be subtracted from the pressure factor 10 times a second.
-    tyrePunctureDeflateFactor[tyreIndex] = 1 / math.random(minFactor, maxFactor)
-    -- Set the tyre pressure factor to start the deflation from. See ac.setTyreInflation() comment in slowTyrePuncture().
-    tyrePuncturePressureFactor[tyreIndex] = 1.0
-    overheadMessageQueue("Tyre puncture", getWheelName(tyreIndex) .. " tyre is leaking!", 3)
-    printDebug(string.format("Puncture factor, tyre: %d", tyreIndex), string.format("%f", tyrePunctureDeflateFactor[tyreIndex]))
-    logDebug("<FLR>Tyre Puncture, tyre: ", tyreIndex, " Deflate factor: ", tyrePunctureDeflateFactor[tyreIndex], true)
-end
-
-local function getTyreTypeFactor()
-    local tyreTypeFactors = {
-        {"SH", 1.2},
-        {"HS", 4},
-        {"LS", 4},
-        {"HSI", 1},
-        {"FS", 4}
-    }
-    local tyreName = ac.getTyresName(thisCar.index)
-    printDebug("tyreName", tyreName)
-    local tyreTypeFactor = 1
-    for i = 1, #tyreTypeFactors do
-        if tyreName == tyreTypeFactors[i][1] then
-            tyreTypeFactor = tyreTypeFactors[i][2]
-            break
-        end
-    end
-
-    return tyreTypeFactor
-end
-
---tyre blow function. rest of tyre stuff in other functions
-local function tyreBlow()
-    local checkTyreBlow = not isCarInPits and thisCar.speedKmh > 1
-    local tyreTypeFactor = getTyreTypeFactor()
-    printDebug("tyreTypeFactor", tyreTypeFactor)
-
-    for i = 0, 3 do
-        -- Car must be out of the pits and not in the grid, moving and tyre must not be already punctured.
-        if checkTyreBlow and tyrePunctureDeflateFactor[i] == 0.0 then
-            local rateToUse = 0
-
-            if thisCar.wheels[i].surfaceExtendedType == ac.SurfaceExtendedType.Gravel then
-                rateToUse = tyrePunctureRateGravel
-                ac.setTyreWearMultiplier(i, tyreWearGravel)
-                trackSurfaceType = ac.SurfaceExtendedType.Gravel
-            elseif thisCar.wheels[i].surfaceExtendedType == ac.SurfaceExtendedType.Ice or
-                   thisCar.wheels[i].surfaceExtendedType == ac.SurfaceExtendedType.Snow then
-                rateToUse = tyrePunctureRateIce
-                ac.setTyreWearMultiplier(i, tyreWearIce)
-                trackSurfaceType = ac.SurfaceExtendedType.Ice
-            else
-                rateToUse = tyrePunctureRateAsphalt
-                ac.setTyreWearMultiplier(i, tyreWearAsphalt)
-                trackSurfaceType = ac.SurfaceExtendedType.Base
-            end
-
-            -- Modify rateFactor so that more worn tyres are more likely to puncture. The tyreWear table
-            -- contains the accumulated wear since the start of the session, 0 meaning brand new tyres and
-            -- 1 meaning fully worn tyres.
-            local tyreWearFactor = 1.0 - math.min(tyreWear[i] * tyreTypeFactor, 0.999)
-            rateToUse = math.floor(rateToUse * tyreWearFactor + 0.5)
-            printDebug(string.format("Puncture rate, tyre: %d", i), string.format("%d", rateToUse))
-            if DEBUG_LOG_FILE then
-                tyrePunctureRates[i] = rateToUse
-            end
-
-            local tyrePunctureTesting = false
-            if TEST_CODE and tyrePunctureTestIndex == i then
-                tyrePunctureTesting = true
-            end
-            if math.random(1, rateToUse) == 1 or tyrePunctureTesting then
-                generateSlowPuncture(i, minPunctureDeflateFactor, maxPunctureDeflateFactor)
-            end
-        end
-
-        --check tyre pressure for each wheel and set to blow if it's too high
-        if thisCar.wheels[i].tyrePressure > tyreBlowPressure and thisCar.wheels[i].isBlown == false and tyrePunctureDeflateFactor[i] == 0.0 then
-            -- In this case, make sure the tyre always deflates quickly.
-            generateSlowPuncture(i, minPunctureDeflateFactor, minPunctureDeflateFactor)
-
-            if currentSpares > 0 then
-                overheadMessageQueue("Spares available", "You have " .. currentSpares .. " spares left, pull over to the side when safe.", 2)
-            else
-                overheadMessageQueue("No spares", "You have no spares left, just get to the pits safely!", 2)
-            end
-        end
-        --check tyrevKM and blow it if its past its life
-        if thisCar.wheels[i].tyreVirtualKM > tyrevKMs[i] and thisCar.wheels[i].isBlown == false and tyrePunctureDeflateFactor[i] == 0.0 then
-            generateSlowPuncture(i, minPunctureDeflateFactor, maxPunctureDeflateFactor)
-
-            if currentSpares > 0 then
-                overheadMessageQueue("Spares available", "You have " .. currentSpares .. " spares left, pull over to the side when safe.", 2)
-            else
-                overheadMessageQueue("No spares", "You have no spares left, just get to the pits safely!", 2)
-            end
-        end
-    end
-end--end of tyre blow function
-
--- Slow tyre puncture: deflate the tyre over time.
-local function slowTyrePuncture()
-    for i = 0, 3 do
-        -- If the tyre is punctured, we need to deflate it.
-        if tyrePunctureDeflateFactor[i] > 0.0 then
-            -- Calculate new (deflated) pressure factor and set it to the tyre.
-            tyrePuncturePressureFactor[i] = tyrePuncturePressureFactor[i] - tyrePunctureDeflateFactor[i]
-            -- Limit the pressure factor to 0, to blow the tyre.
-            if tyrePuncturePressureFactor[i] < 0 then
-                tyrePuncturePressureFactor[i] = 0
-            end
-            -- Set the deflated tyre pressure. setTyreInflation() takes a "percentage" as a parameter,
-            -- from 0 to 1. 1 sets the full original pressure, and e.g. 0,5 sets half of that. For
-            -- example, if the original pressure value was 50 psi, setting 0,5 here would set the pressure
-            -- to 25 psi. When the factor reaches zero, the tyre will be blown.
-            ac.setTyreInflation(i, tyrePuncturePressureFactor[i])
-
-            printDebug(string.format("Set tyre: %d", i), string.format("deflated pressure: %f", tyrePuncturePressureFactor[i]))
-        end
-    end
-end
-
-local function isAnyTyrePunctured()
-    for i = 0, 3 do
-        if tyrePunctureDeflateFactor[i] > 0.0 then
-            return true
-        end
-    end
-    return false
-end
-
-local function updateTyreWear()
-    for i = 0, 3 do
-        if thisCar.wheels[i].tyreWear > prevTyreWear[i] then
-            local wearDiff = thisCar.wheels[i].tyreWear - prevTyreWear[i]
-            tyreWear[i] = tyreWear[i] + wearDiff
-            prevTyreWear[i] = thisCar.wheels[i].tyreWear
-            printDebug(string.format("tyreWear " .. i), tyreWear[i])
-        end
-    end
-end
-
---helper function for generating a fresh tyre.
-local function generateTyrevKM()
-    local randomFactor = math.random() -- Uniform random value between 0 and 1
-    -- Apply weighting toward the upper end of the range
-    local weightedLife = tyreBasevKM + (tyrevKMvariance * (randomFactor ^ biasStrength))
-    return weightedLife
-end
-
-local function blowTyreAtCrash(damageDiff, sideDamage1, sideDamage2, tyre1, tyre2)
-    local tyreToBlow = 0
-    local rate = tyreBlowCrashingRate
-
-    -- In a really hard crash, just blow both tyres.
-    if damageDiff > tyreBlowDamageChangeMax then
-        ac.setTyreInflation(tyre1, 0)
-        ac.setTyreInflation(tyre2, 0)
-        return
-    end
-
-    -- Check if there is enough change in damage to blow a tyre.
-    if damageDiff > tyreBlowDamageChange then
-        -- Is the damage hard enough to blow the tyre using 100% probability?
-        if damageDiff > tyreBlowDamageChangeHard then
-            rate = 1
-        end
-
-        -- Blow the tyre from that side, which has more damage.
-        -- For example, if this is a front crash, then choose left or right.
-        if sideDamage1 > sideDamage2 then
-            tyreToBlow = tyre1
-        else
-            tyreToBlow = tyre2
-        end
-
-        if math.random(1, rate) == 1 then
-            ac.setTyreInflation(tyreToBlow, 0)
-        end
-    end
-end
-
--- Blow a tyre when the car is crashed into something. Check the change in
--- car damage, and when it exceeds the predefined value, then blow a tyre.
-local function tyreBlowWhenCrashing()
-    printDebug("-Front dmg", thisCar.damage[0])
-    printDebug("-Rear dmg", thisCar.damage[1])
-    printDebug("-Left dmg", thisCar.damage[2])
-    printDebug("-Right dmg", thisCar.damage[3])
-
-    -- Front crash.
-    blowTyreAtCrash(thisCar.damage[0] - prevDamageFront, thisCar.damage[2], thisCar.damage[3], 0, 1)
-    -- Rear crash.
-    blowTyreAtCrash(thisCar.damage[1] - prevDamageRear, thisCar.damage[2], thisCar.damage[3], 2, 3)
-    -- Left crash.
-    blowTyreAtCrash(thisCar.damage[2] - prevDamageLeft, thisCar.damage[0], thisCar.damage[1], 0, 2)
-    -- Right crash.
-    blowTyreAtCrash(thisCar.damage[3] - prevDamageRight, thisCar.damage[0], thisCar.damage[1], 1, 3)
-
-    prevDamageFront = thisCar.damage[0]
-    prevDamageRear = thisCar.damage[1]
-    prevDamageLeft = thisCar.damage[2]
-    prevDamageRight = thisCar.damage[3]
-end
-
---coolant behavior/engine damage handling
-local function coolantBehavior(dt)
-    carDamageClamp = math.clampN((thisCar.damage[0] + thisCar.damage[2] + thisCar.damage[3]) / 3 * 0.01, 0, 1)
-    --clamp the actual bumper damage as ac can make it over 100%
-    if thisCar.damage[0] > 30 or thisCar.damage[2] > 35 or thisCar.damage[3] > 35 then
-        if hasRadiatorDamage == false then
-            hasRadiatorDamage = true
-            overheadMessageQueue("Cooling damage", "Engine cooling is slightly damaged. Watch for engine temps.", 2)
-        end
-    end
-
-    --if damage is over 50% you lose some of the brake power
-    if thisCar.damage[0] > 50 or thisCar.damage[2] > 50 or thisCar.damage[3] > 50 then
-        if brakesFailed == false then
-            brakesFailed = true
-            overheadMessageQueue("Brake problem", "Front damage caused brakes to lose power. Take it careful!", 3)
-        end
-    end
-    if brakesFailed == true then
-        if randomBrakeLimit == nil then
-            randomBrakeLimit = 0.4 + math.random() * (0.9 - 0.4)
-        end
-        if acCarPhysics.brake > randomBrakeLimit then
-            acCarPhysics.brake = randomBrakeLimit
-        end
-    end
-
-
-    if thisCar.damage[0] > 75 or thisCar.damage[2] > 75 or thisCar.damage[3] > 75  then
-        if hasRadiatorMajorDamage == false then
-            hasRadiatorMajorDamage = true
-        if acCarPhysics.engineLifeLeft > 500 then
-            acCarPhysics.engineLifeLeft = 500
-        end
-        overheadMessageQueue("Major radiator damage", "Engine cooling has major damage. Watch for engine temps.", 2)
-        end
-    end
-
-    if engineTemp > engineOverboilTemp and totalMeltdown == false then
-        totalMeltdown = true
-        overheadMessageQueue("Engine meltdown", "Your racing prospects are over!", 5)
-        acCarPhysics.engineLifeLeft = 0
-    end
-
-    if coolantTemp > engineOverboilTemp - 5 and not waterTempWarning then
-        overheadMessageQueue("Coolant temperature", "Water temperature is nearing boiling point. Hold off the throttle.", 3)
-        waterTempWarning = true
-    end
-
-    if engineTemp > engineOverboilTemp - 5 then
-        if acCarPhysics.gas > 0.8 then
-            acCarPhysics.gas = 0.8
-        end
-    end
-
-    --all the radiator/engine thermals are handled here
-
-    engineAmbientFactor = math.clamp(math.log(engineTemp - airAmbientTemp) * engineTemp^0.01 * engineCoolAmbientFalloff, 0, 1)
-    radiatorAmbientFactor = math.clamp(math.log(coolantTemp - airAmbientTemp) * coolantTemp^0.01 *engineCoolAmbientFalloff, 0, 1)
-
-    engineHeatingFactor = (1 - engineGainThrottleCoefficient^(-5 * (acCarPhysics.rpm * 0.0001))) * currentEngineHeatGainMult * acCarPhysics.gas
-
-    if oilPressureFailureActive == true then
-        engineHeatingFactor = engineHeatingFactor * 1.25
-    end
-
-    engineCoolingFactor = (engineBaseCoolCoefficient + engineSpeedCoolCoefficient * acCarPhysics.speedKmh^2) * engineAmbientFactor
-    engineTemp = engineTemp + ((engineHeatingFactor - engineCoolingFactor) * dt)
-
-    radiatorCoolingFactor = (math.clamp(radiatorCoolCoefficient - (radiatorDamageCoefficientLoss * carDamageClamp), 0, 1) + radiatorSpeedCoolCoefficient * acCarPhysics.speedKmh^2) * radiatorAmbientFactor
-    coolantTemp = coolantTemp - (radiatorCoolingFactor * dt)
-
-    --temperatureAvg = ((engineTemp * engineCoolantTransferGain) + (coolantTemp * (1 - engineCoolantTransferGain))) * 0.5
-    temperatureDifferential = (engineTemp - coolantTemp) * dt
-
-    engineTemp = engineTemp - (temperatureDifferential * engineCoolantTransferGain)
-    coolantTemp = coolantTemp + (temperatureDifferential * engineCoolantTransferGain)
-
-    --give weighted transfer gains another try once i get back home
-    --engineTemp = engineTemp - (temperatureDifferential * engineCoolantTransferGain)
-    --coolantTemp = coolantTemp + (temperatureDifferential * (1 - engineCoolantTransferGain))
-
-    --coolantTemp = math.lerp(coolantTemp, temperatureAvg, 0.5)
-    --engineTemp = math.lerp(engineTemp, temperatureAvg, 0.5)
-
-    --prevent temps go under 70 if idle or waiting for race start
-    coolantTemp = math.max(coolantTemp, 70)
-    engineTemp = math.max(engineTemp, 70)
-
-    acCarPhysics.controllerInputs[0] = coolantTemp
-    acCarPhysics.controllerInputs[1] = engineTemp
-    --these dynamic controllers can be read by analog or digital instruments with INPUT = CPHYS_SCRIPT_X
-
-end--end of coolant behavior function
-
-local function getBrakeDuctWingGain(brakeDuctPercentage)
-    local steps = {
-        {duct = 0, wingGain = 1.00000},
-        {duct = 30, wingGain = 0.99200},
-        {duct = 60, wingGain = 0.98400},
-        {duct = 90, wingGain = 0.97600},
-    }
-
-    -- Find the step with the brakeDuctPercentage value. Default to the first step if not found.
-    local s = steps[1]
-    for _, step in ipairs(steps) do
-        if step.duct == brakeDuctPercentage then
-            s = step
-            break
-        end
-    end
-
-    return s.wingGain
-end
-
---radiator setup
-local function applyRadiatorSetup(setup)
-    local flapPosition = {
-        "Shutters fully open",
-        "Shutters one quarter closed",
-        "Shutters half closed",
-        "Shutters three quarters closed",
-        "Shutters almost closed"
-    }
-
-    -- Get brake duct settings from setup and combine their effects with the radiator setup.
-    local brakeDuctPercentageFront = ac.getScriptSetupValue("BRAKE_DUCT_F")()
-    printDebug("BrakeDuct F", brakeDuctPercentageFront)
-    local brakeDuctPercentageRear = ac.getScriptSetupValue("BRAKE_DUCT_R")()
-    printDebug("BrakeDuct R", brakeDuctPercentageRear)
-    local brakeDuctWingGainFront = getBrakeDuctWingGain(brakeDuctPercentageFront)
-    printDebug("BrakeDuct Wing Gain F", brakeDuctWingGainFront)
-    local brakeDuctWingGainRear = getBrakeDuctWingGain(brakeDuctPercentageRear)
-    printDebug("BrakeDuct Wing Gain R", brakeDuctWingGainRear)
-
-    -- map setup steps to wing gain + cooling multiplier
-    local steps = {
-        {wingIndex = 0, wingGain = 1.00000, coolMul = 1.00},
-        {wingIndex = 0, wingGain = 0.98000, coolMul = 0.85},
-        {wingIndex = 0, wingGain = 0.96000, coolMul = 0.70},
-        {wingIndex = 0, wingGain = 0.94000, coolMul = 0.55},
-        {wingIndex = 0, wingGain = 0.92000, coolMul = 0.40},
-    }
-    local s = steps[setup + 1]
-    ac.setWingGain(s.wingIndex, s.wingGain * brakeDuctWingGainFront * brakeDuctWingGainRear, 1)
-    printDebug("Combined Wing Gain", s.wingGain * brakeDuctWingGainFront * brakeDuctWingGainRear)
-    radiatorCoolCoefficientBase = radiatorCoolCoefficientInitialValue * s.coolMul
-    return flapPosition[setup + 1]
-end
-
--- call once so current setup is applied on load
-applyRadiatorSetup(radiatorSetup)
 
 --this quick helper func to convert some of the setup params to bool.
 local function inputToBool(value)
-    maldito = {}
-    maldito[0] = false
-    maldito[1] = true
-    return maldito[value]
+    return value == true or value == 1 or value == "1"
 end
 
-local function getCurrentSpares()
-    local spares = ac.getScriptSetupValue("SPARE_WHEELS")()
-    printDebug("Current spares", spares)
-        if spares == "Trackside" then
-            spares = -1
-        end
+local function updateScriptSetupToggles()
+    if isNonSynchroGearboxEnabled() and edwardianGearboxSetupToggleEnabled then
+        setDoubleClutchGearboxSetupEnabled(inputToBool(ac.getScriptSetupValue("DOUBLE_CLUTCH_GEARBOX")()))
+    else
+        setDoubleClutchGearboxSetupEnabled(true)
+    end
 
-    return spares
+    if setManualOilPumpDriverEnabled then
+        setManualOilPumpDriverEnabled(inputToBool(ac.getScriptSetupValue("MANUAL_OIL_PUMP")()))
+    end
+
+    if setManualFuelPressureDriverEnabled then
+        setManualFuelPressureDriverEnabled(inputToBool(ac.getScriptSetupValue("MANUAL_FUEL_PRESSURE")()))
+    end
+end
+
+local function getThermalStressTemperature()
+    if isAirCoolingSystemEnabled and isAirCoolingSystemEnabled() then
+        return engineTemp
+    end
+
+    return coolantTemp
+end
+
+local function getCoolingSetupTitle()
+    if isAirCoolingSystemEnabled and isAirCoolingSystemEnabled() then
+        return "Cooling intake setup"
+    end
+
+    return "Radiator setup"
 end
 
 --this function gets the setup menu values for the tyre pressures (so that when you restore a wheel, it gives the correct static pressure, in case its not built-in)
 --and also the count of spare wheels. the spare wheels get also replaced with a fresh set of spares when you pit.
 
 --get some setup params when leaving pits so that they can be reset to the original state at one point or another
-local function setupBits()
+local function setupBits(dt)
     local inGrid = (ac.getSim().raceSessionType == ac.SessionType.Race and not ac.getSim().isSessionStarted)
+    if not isCarInPits then
+        pitWaterCoolingApplied = false
+    end
+
+    applyCVRPitCrewTyreSelection(dt)
+
     --check if cars in pit to reset the values, and also check nil for initialization
     if isCarInPits or inGrid or tyrePressures[0] == nil then
         --get setup tyre pressures, and initialize vKMs
-        for i = 0, 3 do
-            -- 1.0 means inflated to the pressure defined in the setup.
-            tyrePressures[i] = 1.0
-            ac.setTyreInflation(i, tyrePressures[i])
-            -- Only generate a new lifespan if the tyre is not already initialized
-            if not tyrevKMs[i] or tyrevKMs[i] < thisCar.wheels[i].tyreVirtualKM then
-                tyrevKMs[i] = generateTyrevKM()
-                -- tyrevKMs[i] = thisCar.wheels[i].tyreVirtualKM + generateTyrevKM()
-            end
-            --debugTyrevKMs() -- Log initialized vKM values
-            tyrePunctureDeflateFactor[i] = 0.0
-
-            -- Reset the tyre wear for the replaced tyre(s).
-            tyreWear[i] = 0.0
-            prevTyreWear[i] = 0.0
-
-            -- Check if brake wear is to be reset when changing tyres.
-            if resetBrakeWearAtTyreChange ~= nil then
-                if resetBrakeWearAtTyreChange == true and thisCar.wheels[i].tyreVirtualKM < 0.1 then
-                    brakeWearLevel = 0.0
+        if ac.getCar(0).isChangingTyres or inGrid or tyrePressures[0] == nil then
+            for i = 0, 3 do
+                -- 1.0 means inflated to the pressure defined in the setup.
+                tyrePressures[i] = 1.0
+                ac.setTyreInflation(i, tyrePressures[i])
+                --ac.debug("Tyre stuff fired",i)
+                -- Only generate a new lifespan if the tyre is not already initialized
+                if not tyrevKMs[i] or tyrevKMs[i] < thisCar.wheels[i].tyreVirtualKM then
+                    tyrevKMs[i] = generateTyrevKM()
+                    -- tyrevKMs[i] = thisCar.wheels[i].tyreVirtualKM + generateTyrevKM()
                 end
+                --debugTyrevKMs() -- Log initialized vKM values
+                tyrePunctureDeflateFactor[i] = 0.0
+
+                -- Reset the tyre wear for the replaced tyre(s).
+                resetTyreWearTracking(i)
+            end--end of tyre vKM generation
+
+            -- Check if brake wear is to be reset when changing tyres in pits.
+            -- This is done outside the per-wheel loop since brakeWearLevel is a single value.
+            -- We check isChangingTyres directly rather than tyreVirtualKM, because the game
+            -- resets VKM only after the tyre change completes (i.e. after isChangingTyres turns false),
+            -- so VKM is still the old value while this code runs.
+            if resetBrakeWearAtTyreChange == true and ac.getCar(0).isChangingTyres then
+                brakeWearLevel = 0.0
             end
-        end--end of tyre vKM generation
+        end
 
         -- Get a bunch of stuff that should be reset when you enter pits
         -- but only if engine has been fixed already.
         if acCarPhysics.engineLifeLeft == 1000 then
-            sparkPlugFailed = false
-
             valveFailed = false
             valveFailureActive = false
             valveFailureElapsed = 0
             valveFailureDamage = valveFailureMinDamage
-
-            oilPressureFailed = false
-            oilPressureFailureActive = false
-            oilPressureFailureElapsed = 0
-            oilPressureFailureDamage = oilPressureFailureMinDamage
 
             -- Cut the failure rate losses to half, if the engine has been fixed,
             -- i.e. if there was engine damage before entering the pits.
@@ -1163,21 +419,51 @@ local function setupBits()
         --MAKE SURE TO ADD THE LINE INTO THE SETUP.INI!!!
         currentSpares = getCurrentSpares()
         overheadMessagesEnabled = inputToBool(ac.getScriptSetupValue("OVERHEAD_MESSAGES")())
-        radiatorSetup = ac.getScriptSetupValue("RADIATOR")()
-        applyRadiatorSetup(radiatorSetup)
+
         tyreChangeInProgress = false
 
-        -- Drop coolant temp down to a more reasonable temp... (irl they throw buckets of water on the rads)
-        if coolantTemp > 80 or engineTemp > 80 then
-            coolantTemp = 80
-            engineTemp = 80
-        else
-            --once thats been called, reset JEFF the next time around
-            totalMeltdown = false
+        -- Pit crew cooling: if the engine/cooling system arrives very hot,
+        -- knock heat out once instead of snapping temperatures to a fixed value.
+        if isCarInPits and not pitWaterCoolingApplied then
+            if cleanRadiatorDustClog then
+                cleanRadiatorDustClog(radiatorDustClogPitCleanFraction)
+            end
+
+            if not (isAirCoolingSystemEnabled and isAirCoolingSystemEnabled()) and coolantTemp > pitWaterCoolingTemperatureThresholdCelsius then
+                coolantTemp = coolantTemp - pitWaterCoolingDropCelsius
+            end
+
+            if engineTemp > pitWaterCoolingTemperatureThresholdCelsius then
+                engineTemp = engineTemp - pitWaterCoolingDropCelsius
+                if isAirCoolingSystemEnabled and isAirCoolingSystemEnabled() then
+                    coolantTemp = math.min(coolantTemp, engineTemp)
+                end
+            end
+
+            pitWaterCoolingApplied = true
+        end
+
+        -- Once the crew has cooled the car enough, allow temperature warnings
+        -- to appear again later if it overheats after leaving the pits.
+        if getThermalStressTemperature() < engineOverheatWarningTemperatureCelsius - 4 then
             waterTempWarning = false
+        end
+
+        if engineTemp < engineOverheatDamageStartTemperatureCelsius - 4 then
+            engineOverheatDamageWarning = false
         end
         --SETTING CAR EXTRA MASS (SPARE WHEEL) CAN BE DONE IN UPDATE LOOP!!
     end--end of checking if car is in pits insanity
+
+    updateScriptSetupToggles()
+
+    if ((lastSetupRad or -1) ~= ac.getScriptSetupValue("RADIATOR")()) or radiatorSetup == nil then
+        radiatorSetup = ac.getScriptSetupValue("RADIATOR")()
+        lastSetupRad = radiatorSetup
+        prevRadiatorSetup = radiatorSetup
+        applyRadiatorSetup(radiatorSetup)
+        --overheadMessageQueue("Radiator setup SetupBits", ac.getScriptSetupValue("RADIATOR")(), 3, true)
+    end
 
     -- Fix turbo in other sessions, than race.
     if superchargerExists == 1 and isCarInPits and ac.getSim().raceSessionType ~= ac.SessionType.Race then
@@ -1188,7 +474,7 @@ local function setupBits()
         prevFailedTurboCount = 0
     end
 
-    -- Call the radiator dmg warning resets only after radiator has been fixed.
+    -- Call the cooling damage warning resets only after body cooling damage has been fixed.
     -- For this we don't need to be in the pits. It fixes a bug where a pit
     -- stop was not correctly detected, therefore faults stayed active, even though
     -- they were fixed during the pit stop.
@@ -1200,118 +486,6 @@ local function setupBits()
         randomBrakeLimit = nil
     end
 end--end of setupbits function
-
-local function getDistanceToClosestTyreStack()
-    local carPositionOnTrack = thisCar.splinePosition * ac.getSim().trackLengthM
-    -- Find the distance to the closest tyre stack.
-    local closestTyreStackDistance = math.huge
-    for i = 1, #tyreStacksPositions do
-        local stackPosition = tyreStacksPositions[i]
-        local distance = math.abs(stackPosition - carPositionOnTrack)
-        if distance < closestTyreStackDistance then
-            closestTyreStackDistance = distance
-        end
-    end
-
-    return closestTyreStackDistance
-end
-
--- Get tyre change time. If we're doing a 30's tyre change, calculate the time based on
--- the distance to the closest tyre stack.
-local function getTyreChangeTime()
-    if currentSpares >= 0 then
-        return tyreReplacementTime
-    end
-
-    local jeffRunSpeedMs = 4.0
-    local timeToTyreStackAndBack = getDistanceToClosestTyreStack() / jeffRunSpeedMs * 2
-    printDebug("Time to tyre stack and back", timeToTyreStackAndBack)
-
-    return tyreReplacementTime + timeToTyreStackAndBack
-end
-
---tyre replacement bits - this function is the whole routine
-local function tyreReplacement(dt)
-    --dont check if speed is just 0, chances are that ac sometimes breaks and doesnt let you come to a full stop
-    if thisCar.speedKmh < 1 and thisCar.handbrake == 1 or tyreChangeInProgress then
-        carStoppedTimer = carStoppedTimer + dt
-
-        --starting the tyre replacement routine
-        if carStoppedTimer > tyreReplacementReactionTime and tyreChangeInProgress == false then
-            --check that there is actually a burst tyre
-            blownTyres = false
-            for i = 0, 3 do
-                if thisCar.wheels[i].isBlown or tyrePunctureDeflateFactor[i] > 0.0 then
-                    tyreChangeInProgress = true
-                    blownTyres = true
-                end
-            end
-            --check that you have an available spare, if not, cancel routine
-            --also reset the timer, no point in checking it every tick if you dont have a spare
-            if currentSpares == 0 then
-                tyreChangeInProgress = false
-                blownTyres = false
-                ac.setSystemMessage("You have no spare tyres left", "Drive carefully to the pits")
-            end
-            if blownTyres == false then
-                carStoppedTimer = 0
-            end
-        end
-
-        --tyre change routine, seize controls
-        if tyreChangeInProgress then
-            acCarPhysics.gas = 0
-            acCarPhysics.brake = 1
-            acCarPhysics.handbrake = 1
-            local tyreChangeTime = getTyreChangeTime()
-            if carStoppedTimer < tyreChangeTime - tyreReplacementTime then
-                ac.setSystemMessage("Fetching tyre", "Getting a tyre from the nearest stack...")
-                roadsideTyreChange = 1
-            else
-                ac.setSystemMessage("Changing tyre", "Sit tight...")
-                roadsideTyreChange = 2
-            end
-            --skip the queue for this because its essential info regardless
-            --and also breaks the queue by spamming it
-
-            --end the routine once the time has passed
-            if carStoppedTimer > getTyreChangeTime() then
-                overheadMessageQueue("Tyre change complete", "!VAMOS!", 2)
-                tyreChangeInProgress = false
-                roadsideTyreChange = 3
-                currentSpares = math.max(currentSpares - 1, -1)
-                if currentSpares > 0 then
-                    overheadMessageQueue("Tyre change complete", "You have " .. currentSpares .. " spares left.", 3)
-                end
-                if currentSpares == 0 then
-                    tyreStockEmpty = true
-                else
-                    tyreStockEmpty = false
-                end
-                carStoppedTimer = 0
-                for i = 0, 3 do
-                    if thisCar.wheels[i].isBlown or tyrePunctureDeflateFactor[i] > 0.0 then
-                        ac.setTyreInflation(i, tyrePressures[i])
-                        --because current vKM doesnt reset when just reinflating the tyre, add the existing vKM on top.
-                        tyrevKMs[i] = thisCar.wheels[i].tyreVirtualKM + generateTyrevKM()
-                        tyrePunctureDeflateFactor[i] = 0.0
-                        -- Reset the tyre wear for the replaced tyre.
-                        tyreWear[i] = 0.0
-                        break;
-                    end
-                end--find the first tyre and repair it
-            end--end of repair routine
-
-        end--end of seizing controls
-        acCarPhysics.controllerInputs[3] = carStoppedTimer
-    end--end of stop-checking
-
-    if thisCar.speedKmh > 30 then
-        roadsideTyreChange = 0
-    end
-
-    printDebug("Tyre change state", roadsideTyreChange)
-end--end of tyre replacement function
 
 local function adjustRatesAccordingToEngineMap()
     local engineMap = thisCar.fuelMap + 1
@@ -1332,134 +506,26 @@ local function adjustRatesAccordingToEngineMap()
     end
 end
 
-local function fuelTankDamage()
-    local cumulativeDamage = 0
-
-    for i = 0, 3 do
-        if fuelLeakageDamageSides[i + 1] then
-            cumulativeDamage = cumulativeDamage + thisCar.damage[i]
-        end
-    end
-
-    printDebug("Cumulative damage for fuel leakage", cumulativeDamage)
-
-    if cumulativeDamage > fuelLeakageDamageThreshold then
-        local fuelConsumptionRate = normalFuelConsumptionRate + cumulativeDamage / 100
-
-        if fuelConsumptionRate > 1 then
-            fuelConsumptionRate = 1
-        end
-
-        ac.setFuelConsumption(fuelConsumptionRate)
-        printDebug("Fuel consumption rate", fuelConsumptionRate)
-        fuelLeakageDamage = true
-    else
-        ac.setFuelConsumption(normalFuelConsumptionRate)
-        printDebug("Fuel consumption rate", normalFuelConsumptionRate)
-        fuelLeakageDamage = false
-    end
-end
-
-local fuelExhState = 0
-local fuelExhStartCount = 0
-local fuelExhStartCounter = 0
-local fuelExhCutLength = 0
-local fuelDependentGForceThreshold = 0
-local fuelExhInterval = 0
-local fuelExhIntervalCounter = 0
-
-local function fuelExhaustion()
-    printDebug("Fuel, fuelExhState", fuelExhState)
-    -- Adjust the g-force threshold based on the current fuel level. The less fuel we have,
-    -- the easier it is to trigger a stall.
-    fuelDependentGForceThreshold = fuelExhaustionGForceThreshold * (thisCar.fuel / fuelExhaustionAmount)
-    printDebug("Fuel, G-force", fuelDependentGForceThreshold)
-
-    -- Idle state.
-    if fuelExhState == 0 then
-        if math.abs(acCarPhysics.gForces.x) > fuelDependentGForceThreshold and thisCar.fuel < fuelExhaustionAmount then
-            fuelExhStartCount = thisCar.fuel
-            fuelExhStartCounter = 0
-            fuelExhCutLength = 0
-            fuelExhInterval = 0
-            fuelExhIntervalCounter = 0
-            fuelExhState = 10
-        end
-    -- Stall detection state. Wait for enough g-force events to trigger a stall. The less we have fuel,
-    -- the easier it is to trigger a stall.
-    elseif fuelExhState == 10 then
-        if math.abs(acCarPhysics.gForces.x) > fuelDependentGForceThreshold then
-            fuelExhStartCounter = fuelExhStartCounter + 1
-        else
-            fuelExhStartCounter = 0
-            fuelExhState = 0
-        end
-
-        if fuelExhStartCounter >= fuelExhStartCount then
-            fuelExhCutLength = math.random() * (fuelExhaustionAmount - thisCar.fuel) / fuelExhaustionAmount / 2
-            -- Take the speed of the car into account: under 100 km/h the cut length is minimal, but at higher speeds
-            -- the cut length increases quadratically.
-            fuelExhCutLength = fuelExhCutLength + (thisCar.speedKmh / 100) ^ 2
-            printDebug("Fuel, cut length", fuelExhCutLength)
-            fuelExhInterval = math.random() * 2
-            fuelExhState = 20
-        end
-    -- Fuel cut active state.
-    elseif fuelExhState == 20 then
-        if fuelExhCutLength == 0 then
-            if fuelExhIntervalCounter > fuelExhInterval then
-                fuelExhState = 0
-            else
-                fuelExhIntervalCounter = fuelExhIntervalCounter + 0.1
-            end
-        end
-    end
-end
-
-local function limitEngineDamageAtCrash()
-    -- When the car touches for example a wall just slightly, the engine can take a huge amount of damage,
-    -- which is not very realistic. To limit this, we can check the change in damage at front, and if it's
-    -- not too big, then we can limit the engine damage.
-    local damageDiffFront = thisCar.damage[0] - prevDamageFrontEngine
-    local damageDiffRear = thisCar.damage[1] - prevDamageRearEngine
-    local damageDiffLeft = thisCar.damage[2] - prevDamageLeftEngine
-    local damageDiffRight = thisCar.damage[3] - prevDamageRightEngine
-    printDebug("DmgFront", thisCar.damage[0])
-    printDebug("DmgRear", thisCar.damage[1])
-    printDebug("DmgLeft", thisCar.damage[2])
-    printDebug("DmgRight", thisCar.damage[3])
-
-    if damageDiffLeft > 0 or damageDiffRight > 0 then
-        if damageDiffFront < bodyDamageLimitAtCrashEngine and damageDiffRear < bodyDamageLimitAtCrashEngine then
-            local maxEngineDamage = math.min(currentEngineLifeLeft - acCarPhysics.engineLifeLeft, (damageDiffFront + damageDiffRear) * 10)
-            printDebug("damageDiffFront", damageDiffFront)
-            printDebug("damageDiffRear", damageDiffRear)
-            printDebug("Engine life left before", currentEngineLifeLeft)
-            ac.setEngineLifeLeft(currentEngineLifeLeft - maxEngineDamage)
-            printDebug("Engine life left after", acCarPhysics.engineLifeLeft)
-        end
-    end
-
-    printDebug("Engine life", acCarPhysics.engineLifeLeft)
-    prevDamageFrontEngine = thisCar.damage[0]
-    prevDamageRearEngine = thisCar.damage[1]
-    prevDamageLeftEngine = thisCar.damage[2]
-    prevDamageRightEngine = thisCar.damage[3]
-    currentEngineLifeLeft = acCarPhysics.engineLifeLeft
-end
-
-local function logRates()
-    logDebug("Rates, Spark plug: ", sparkPlugFailureRate)
-    logDebug("Fuel pump: ", fuelPumpFailureRate)
-    logDebug("Valves: ", valveFailureRate)
-    logDebug("Oil pressure: ", oilPressureFailureRate)
-    logDebug("Radiator cool coefficient: ", radiatorCoolCoefficient)
-end
+local resetPitRepairQueue
 
 -- Set everything to initial state. Useful for resetting the
 -- car for a race, for example.
-local function resetCar()
-    sparkPlugFailed = false
+function resetCar(resetElectricalComponents)
+    if isAICar then
+        resetAIFailureSystem()
+        return
+    end
+
+    if randomizeSessionFailureRates then
+        randomizeSessionFailureRates()
+    end
+
+    ac.ControlButton("__EXT_ENGINEMAP_UP"):setDisabled(false)
+    if resetSparkPlugFailures then
+        resetSparkPlugFailures()
+    else
+        sparkPlugFailed = false
+    end
     valveFailed = false
     valveFailureActive = false
     valveFailureElapsed = 0
@@ -1468,22 +534,38 @@ local function resetCar()
     oilPressureFailureActive = false
     oilPressureFailureElapsed = 0
     oilPressureFailureDamage = oilPressureFailureMinDamage
+    resetOilPressureSystem()
     currentSpares = getCurrentSpares()
     hasRadiatorDamage = false
-    hasRadiatorMajorDamage = false
     brakesFailed = false
     brakeWearLevel = 0.0
     boxDamaged = false
     randomBrakeLimit = nil
     fuelPumpFailed = false
+    fuelPumpRepairInProgress = false
+    fuelPumpPitTimer = 0
+    gearboxRepairInProgress = false
+    gearboxPitTimer = 0
+    oilPitRefillInProgress = false
+    oilPitRefillTimer = 0
+    isRepairingBelt = false
+    beltRepairTimer = 0
+    resetFuelTankPressurization()
+    resetRadiatorDustClog()
+    resetAirCoolingSystem(resetElectricalComponents ~= false)
+    resetEngineCrashFire()
     initDeadGears()
+    resetDoubleClutchGearbox()
+    resetDogboxGearbox()
     ac.setEngineLifeLeft(1000)
     carHasTeleportedToPits = false
-    coolantTemp = 70
-    engineTemp = 70
-    radiatorSetup = 0
-    prevRadiatorSetup = 0
-    radiatorCoolCoefficient = radiatorCoolCoefficient
+    resetThermalTemperaturesToAmbient()
+    radiatorCoolCoefficient = radiatorCoolCoefficientInitialValue
+    radiatorCoolCoefficientBase = radiatorCoolCoefficientInitialValue
+    radiatorSetup = ac.getScriptSetupValue("RADIATOR")()
+    prevRadiatorSetup = radiatorSetup
+    applyRadiatorSetup(radiatorSetup)
+    radiatorCoolCoefficient = radiatorCoolCoefficientBase
     sparkPlugFailureRate = sparkPlugFailureRateInitialValue
     sparkPlugFailureRateBase = sparkPlugFailureRateInitialValue
     fuelPumpFailureRate = fuelPumpFailureRateInitialValue
@@ -1492,9 +574,8 @@ local function resetCar()
     valveFailureRateBase = valveFailureRateInitialValue
     oilPressureFailureRate = oilPressureFailureRateInitialValue
     oilPressureFailureRateBase = oilPressureFailureRateInitialValue
-    radiatorCoolCoefficient = radiatorCoolCoefficientInitialValue
-    radiatorCoolCoefficientBase = radiatorCoolCoefficientInitialValue
     hasEngineDamage = false
+    doOnceAtStart = false
 
     if superchargerExists == 1 then
         initTurboVariables(ac, printDebug)
@@ -1505,8 +586,7 @@ local function resetCar()
     end
 
     tyreStockEmpty = false
-    tyreChangeInProgress = false
-    blownTyres = false
+    resetTyreServiceState()
     initTyrePunctureTables()
     for i = 0, 3 do
         ac.setTyreInflation(i, 1.0)
@@ -1515,297 +595,748 @@ local function resetCar()
     initTyreWearTable()
     resetCumulativeRateChanges()
 
+    if resetPitRepairQueue then
+        resetPitRepairQueue()
+    end
 
-    ResetEle()  --added for electricity
+    if resetCVRPitCrewRoadsideServiceState then
+        resetCVRPitCrewRoadsideServiceState()
+    end
+
+    if resetEngineStarter then
+        resetEngineStarter()
+    end
+
+    ResetEle(resetElectricalComponents ~= false)
+    rescue.reset()
 
     logDebug("Physics script version: ", VERSION, true)
     logDebug("Car reset done.")
     logRates()
 end
 
------------------ Debug/testing code -----------------
---
--- While not in pits, press extra B to select a failure,
--- then press and hold extra C until the failure occurs.
--- To clear all failures, select it using extra B, then
--- press extra C.
+-- run resetCar at each session restart
+ac.onSessionStart(function()
+    doOnceAtStart = false
+    resetCar()
+end)
+-- setDisable engineMap button to false at start. just in case it did not reset properly in a previous session
+ac.ControlButton("__EXT_ENGINEMAP_UP"):setDisabled(false)
+-- callbacks to re-enable engineMap button
+function DIH_reEnableEngineMapButton()
+    ac.ControlButton("__EXT_ENGINEMAP_UP"):setDisabled(false)
+end
 
-local failureTypes = {
-    sparkPlugFailure = 1,
-    fuelPumpFailure = 2,
-    valveFailure = 3,
-    oilPressureFailure = 4,
-    gearFailure = 5,
-    tyrePuncture_FL = 6,
-    tyrePuncture_FR = 7,
-    tyrePuncture_RL = 8,
-    tyrePuncture_RR = 9,
-    highSpeedLightCollision1 = 10,
-    highSpeedLightCollision2 = 11,
-    clearAllFailures = 12
-}
+local disposalHandle = ac.onLuaScriptDisposal(function(senderName, senderType, senderID)
+    -- This runs when the script is unloaded
+    DIH_reEnableEngineMapButton()
+end)
 
-local failureDescriptions = {
-    "Spark plug failure",
-    "Fuel pump failure",
-    "Valve failure",
-    "Oil pressure failure",
-    "Gear failure",
-    "Tyre puncture front left",
-    "Tyre puncture front right",
-    "Tyre puncture rear left",
-    "Tyre puncture rear right",
-    "Test high speed collision - 150",
-    "Test high speed collision - 750",
-    "Clear all failures"
-}
+ac.onRelease(DIH_reEnableEngineMapButton)
+ac.onOpenMainMenu(DIH_reEnableEngineMapButton)
+ac.onLuaScriptDisposal(DIH_reEnableEngineMapButton)
 
-local origSparkPlugFailureRateBase = sparkPlugFailureRateBase
-local origFuelPumpFailureRateBase = fuelPumpFailureRateBase
-local origValveFailureRateBase = valveFailureRateBase
-local origOilPressureFailureRateBase = oilPressureFailureRateBase
-local origGearFailureRate = gearFailureRate
-local origBoostedGearFailureRate = boostedGearFailureRate
-local origTyrePunctureRate = tyrePunctureRate
+local inGrid = false
 
-local highSpeedCollisionDone = false
+local PIT_REPAIR_ALTERNATOR = "alternator"
+local PIT_REPAIR_FUEL_PUMP = "fuelPump"
+local PIT_REPAIR_SPARK_PLUGS = "sparkPlugs"
+local PIT_REPAIR_GEARBOX = "gearbox"
+local PIT_REPAIR_OIL = "oil"
+local PIT_REPAIR_AIR_COOLING = "airCooling"
 
-local failureTypeCount = 0
+local CVR_PIT_REPAIR_ALTERNATOR = 1
+local CVR_PIT_REPAIR_FUEL_PUMP = 2
+local CVR_PIT_REPAIR_SPARK_PLUGS = 4
+local CVR_PIT_REPAIR_GEARBOX = 8
+local CVR_PIT_REPAIR_OIL = 16
+local CVR_PIT_REPAIR_AIR_COOLING = 32
 
-local function initFailureTypeCount()
-    for _ in pairs(failureTypes) do
-        failureTypeCount = failureTypeCount + 1
+local pitRepairQueue = {}
+local pitRepairQueueIndex = 0
+local prevPitRepairButtonState = false
+local cvrPitCrewRepairConnection = nil
+local cvrPitCrewOilStatusConnection = nil
+local cvrPitCrewFuelStatusConnection = nil
+local cvrPitCrewServiceStatusConnection = nil
+local cvrPitCrewLastRepairRequestId = 0
+local cvrPitCrewActiveRepairRequestId = 0
+local cvrPitCrewActiveRepairMask = 0
+
+-- Roadside services use a separate channel from the pit queue. A request is
+-- always one item, so roadside work cannot accidentally start in parallel.
+CVR_ROADSIDE_REPAIR_ELECTRICITY = 1
+CVR_ROADSIDE_REPAIR_SPARK_PLUGS = 4
+CVR_ROADSIDE_REPAIR_AIR_COOLING = 32
+local CVR_ROADSIDE_STATE_READY = 0
+local CVR_ROADSIDE_STATE_ARMED = 1
+local CVR_ROADSIDE_STATE_WORKING = 2
+local CVR_ROADSIDE_STATE_COMPLETE = 3
+local CVR_ROADSIDE_STATE_REJECTED = 4
+local cvrPitCrewRoadsideConnection = nil
+local cvrPitCrewRoadsideLastRequestId = 0
+local cvrPitCrewRoadsideActiveTyreMask = 0
+local cvrPitCrewRoadsideActiveRepairMask = 0
+
+do
+    local ok, connection = pcall(ac.connect, {
+        ac.StructItem.key('cvr.pitCrew.tyres.v1'),
+        requestId = ac.StructItem.uint32(),
+        tyreMask = ac.StructItem.uint8(),
+        appliedRequestId = ac.StructItem.uint32(),
+        appliedMask = ac.StructItem.uint8(),
+        status = ac.StructItem.uint8(),
+        carIndex = ac.StructItem.int32(),
+        repairRequestId = ac.StructItem.uint32(),
+        repairMask = ac.StructItem.uint8(),
+        appliedRepairRequestId = ac.StructItem.uint32(),
+        appliedRepairMask = ac.StructItem.uint8(),
+        repairStatus = ac.StructItem.uint8(),
+        repairNeededMask = ac.StructItem.uint8(),
+    }, true, ac.SharedNamespace.Shared)
+    if ok then
+        cvrPitCrewRepairConnection = connection
     end
 end
 
-if TEST_CODE then
-    initFailureTypeCount()
+do
+    local ok, connection = pcall(ac.connect, {
+        ac.StructItem.key('cvr.pitCrew.roadside.v1'),
+        requestId = ac.StructItem.uint32(),
+        tyreMask = ac.StructItem.uint8(),
+        repairMask = ac.StructItem.uint8(),
+        available = ac.StructItem.boolean(),
+        state = ac.StructItem.uint8(),
+        availableTyreMask = ac.StructItem.uint8(),
+        availableRepairMask = ac.StructItem.uint8(),
+        carIndex = ac.StructItem.int32(),
+    }, true, ac.SharedNamespace.Shared)
+    if ok then
+        cvrPitCrewRoadsideConnection = connection
+    end
 end
 
-local selectedFailure = 0
-local originalValue = 0
-local prevExtraBState = false
+do
+    local ok, connection = pcall(ac.connect, {
+        ac.StructItem.key('cvr.pitCrew.status.v2'),
+        carIndex = ac.StructItem.int32(),
+        available = ac.StructItem.boolean(),
+        tankFillFraction = ac.StructItem.float(),
+        tankLeaking = ac.StructItem.boolean(),
+        puncturedTyreMask = ac.StructItem.uint8(),
+    }, true, ac.SharedNamespace.Shared)
+    if ok then
+        cvrPitCrewOilStatusConnection = connection
+    end
+end
 
--- These should not be included in release packages,
--- therefore calls to these functions MUST be behind
--- the TEST_CODE flag!
-local function selectFailureForTesting()
-    if not isCarInPits and not thisCar.extraB and prevExtraBState then
-        selectedFailure = selectedFailure + 1
-        if selectedFailure > failureTypeCount then
-            selectedFailure = 1
+do
+    local ok, connection = pcall(ac.connect, {
+        ac.StructItem.key('cvr.pitCrew.fuelStatus.v1'),
+        carIndex = ac.StructItem.int32(),
+        available = ac.StructItem.boolean(),
+        tankLeaking = ac.StructItem.boolean(),
+    }, true, ac.SharedNamespace.Shared)
+    if ok then
+        cvrPitCrewFuelStatusConnection = connection
+    end
+end
+
+do
+    local ok, connection = pcall(ac.connect, {
+        ac.StructItem.key('cvr.pitCrew.serviceStatus.v4'),
+        carIndex = ac.StructItem.int32(),
+        available = ac.StructItem.boolean(),
+        brakeFailure = ac.StructItem.boolean(),
+        alternatorSeconds = ac.StructItem.float(),
+        fuelPumpSeconds = ac.StructItem.float(),
+        sparkPlugsSeconds = ac.StructItem.float(),
+        gearboxSeconds = ac.StructItem.float(),
+        oilSeconds = ac.StructItem.float(),
+        airCoolingSeconds = ac.StructItem.float(),
+        airCoolingFanDriveType = ac.StructItem.uint8(),
+        electricalIssueMask = ac.StructItem.uint8(),
+        oilPressureFault = ac.StructItem.boolean(),
+        valveFailure = ac.StructItem.boolean(),
+        sparkPlugFailure = ac.StructItem.boolean(),
+        tyreSeconds = ac.StructItem.float(),
+        tyreChangesCanRunWithRepairs = ac.StructItem.boolean(),
+    }, true, ac.SharedNamespace.Shared)
+    if ok then
+        cvrPitCrewServiceStatusConnection = connection
+    end
+end
+
+local function isAnyGearBrokenForPitRepair()
+    if not deadGears then return false end
+
+    for i = 1, thisCar.gearCount do
+        if deadGears[i] then
+            return true
         end
-        prevExtraBState = false
-        printDebug("Selected failure type:", failureDescriptions[selectedFailure], true)
     end
 
-    if thisCar.extraB then
-        prevExtraBState = true
-    else
-        prevExtraBState = false
+    return false
+end
+
+local function needsAlternatorPitRepair()
+    if ignitionType ~= 2 and ignitionType ~= 3 then
+        return false
     end
-end
 
-local function setFailureForTesting()
-    if  not isCarInPits and thisCar.extraC then
-        if selectedFailure == failureTypes.clearAllFailures then
-            resetCar()
-            highSpeedCollisionDone = false
-            tyrePunctureTestIndex = -1
-        elseif selectedFailure == failureTypes.sparkPlugFailure then
-            sparkPlugFailureRateBase = 1
-        elseif selectedFailure == failureTypes.fuelPumpFailure then
-            fuelPumpFailureRateBase = 1
-        elseif selectedFailure == failureTypes.valveFailure then
-            valveFailureRateBase = 1
-        elseif selectedFailure == failureTypes.oilPressureFailure then
-            oilPressureFailureRateBase = 1
-        elseif selectedFailure == failureTypes.gearFailure then
-            gearFailureRate = 1
-            boostedGearFailureRate = 1
-        elseif selectedFailure == failureTypes.tyrePuncture_FL then
-            tyrePunctureTestIndex = 0
-        elseif selectedFailure == failureTypes.tyrePuncture_FR then
-            tyrePunctureTestIndex = 1
-        elseif selectedFailure == failureTypes.tyrePuncture_RL then
-            tyrePunctureTestIndex = 2
-        elseif selectedFailure == failureTypes.tyrePuncture_RR then
-            tyrePunctureTestIndex = 3
-        elseif selectedFailure == failureTypes.highSpeedLightCollision1 then
-            if not highSpeedCollisionDone then
-                prevDamageRightEngine = prevDamageRightEngine - 10
-                prevDamageFrontEngine = prevDamageFrontEngine - 7
-                prevDamageRearEngine = prevDamageRearEngine - 8
-                ac.setEngineLifeLeft(acCarPhysics.engineLifeLeft-500)
-                highSpeedCollisionDone = true
-            end
-        elseif selectedFailure == failureTypes.highSpeedLightCollision2 then
-            if not highSpeedCollisionDone then
-                prevDamageRightEngine = prevDamageRightEngine - 5
-                prevDamageFrontEngine = prevDamageFrontEngine - 21
-                ac.setEngineLifeLeft(acCarPhysics.engineLifeLeft-750)
-                highSpeedCollisionDone = true
-            end
-        end
-    else
-        sparkPlugFailureRateBase = origSparkPlugFailureRateBase
-        fuelPumpFailureRateBase = origFuelPumpFailureRateBase
-        valveFailureRateBase = origValveFailureRateBase
-        oilPressureFailureRateBase = origOilPressureFailureRateBase
-        gearFailureRate = origGearFailureRate
-        boostedGearFailureRate = origBoostedGearFailureRate
-        tyrePunctureRate = origTyrePunctureRate
-        tyrePunctureTestIndex = -1
+    if batteryMaxCapacity < 75 or alternatorHealth < 0.9 then
+        return true
     end
+
+    return not alternatorOK
+        or (needsAirCoolingSharedBeltService and needsAirCoolingSharedBeltService())
 end
 
-local function logStaticInfo()
-    logDebug("Track Name: ", ac.getTrackName())
-    logDebug("Car Name: ", ac.getCarName(thisCar.index, true))
-    local brakeDuctPercentageFront = ac.getScriptSetupValue("BRAKE_DUCT_F")()
-    logDebug("BrakeDuct F: ", brakeDuctPercentageFront)
-    local brakeDuctPercentageRear = ac.getScriptSetupValue("BRAKE_DUCT_R")()
-    logDebug("BrakeDuct R: ", brakeDuctPercentageRear)
-    local brakeDuctWingGainFront = getBrakeDuctWingGain(brakeDuctPercentageFront)
-    logDebug("BrakeDuct Wing Gain F: ", brakeDuctWingGainFront)
-    local brakeDuctWingGainRear = getBrakeDuctWingGain(brakeDuctPercentageRear)
-    logDebug("BrakeDuct Wing Gain R: ", brakeDuctWingGainRear)
+local function needsFuelPumpPitRepair()
+    return not (isManualFuelPressureDriverEnabled and isManualFuelPressureDriverEnabled()) and fuelPumpFailed
 end
 
-local function logDebugDataToFile()
-    logRates()
+local function needsSparkPlugPitRepair()
+    return getFouledSparkPlugCount and getFouledSparkPlugCount() > 0
+end
 
-    local tyreName = ac.getTyresName(thisCar.index)
-    local tyreTypeFactor = getTyreTypeFactor()
-    logDebug("Tyre name: ", tyreName, ", factor: ", tyreTypeFactor)
+local function needsOilPitRefill()
+    return oilPressureSystemNeedsPitService and oilPressureSystemNeedsPitService()
+end
 
+local function updateCVRPitCrewOilStatus()
+    if not cvrPitCrewOilStatusConnection then
+        return
+    end
+
+    cvrPitCrewOilStatusConnection.carIndex = thisCar.index or 0
+    cvrPitCrewOilStatusConnection.available = true
+    cvrPitCrewOilStatusConnection.tankFillFraction = math.max(0, math.min(1,
+        (oilTankCurrentLitres or 0) / math.max(oilTankCapacityLitres or 1, 0.001)))
+    cvrPitCrewOilStatusConnection.tankLeaking = oilTankLeakageDamage == true
+
+    local puncturedTyreMask = 0
     for i = 0, 3 do
-        logDebug("Tyre " .. i .. " rate: ", tyrePunctureRates[i])
-        logDebug("Tyre " .. i .. " vkm: ", thisCar.wheels[i].tyreVirtualKM)
+        if thisCar.wheels[i].isBlown or (tyrePunctureDeflateFactor[i] or 0) > 0 then
+            puncturedTyreMask = puncturedTyreMask + 2 ^ i
+        end
     end
-
-    logDebug("Engine / coolant temp: ", engineTemp, " / ", coolantTemp)
-    logDebug("Engine life: ", acCarPhysics.engineLifeLeft)
-    logDebug("Lap time: ", ac.lapTimeToString(thisCar.previousLapTimeMs))
-
-    logDebug("Brake wear: ", brakeWearLevel)
-
-    local turboCount = getTurboCount()
-    for i = 0, turboCount-1 do
-        logDebug("Turbo " .. i .. " fail rate: " .. getTurboFailureRate(i))
-    end
-
-    logDebug("Laps completed: ", thisCar.lapCount)
-    logCumulativeRateChanges()
+    cvrPitCrewOilStatusConnection.puncturedTyreMask = puncturedTyreMask
 end
 
-local function logExtraButtonPresses()
-    if thisCar.extraA and not debugPrevExtraA then
-        logDebug("ExtraA pressed", true)
+local function updateCVRPitCrewFuelStatus()
+    if not cvrPitCrewFuelStatusConnection then
+        return
     end
-    debugPrevExtraA = thisCar.extraA
 
-    if thisCar.extraB and not debugPrevExtraB then
-        logDebug("ExtraB pressed", true)
-    end
-    debugPrevExtraB = thisCar.extraB
-
-    if thisCar.extraC and not debugPrevExtraC then
-        logDebug("ExtraC pressed", true)
-    end
-    debugPrevExtraC = thisCar.extraC
-
-    if thisCar.extraD and not debugPrevExtraD then
-        logDebug("ExtraD pressed", true)
-    end
-    debugPrevExtraD = thisCar.extraD
-
-    if thisCar.extraE and not debugPrevExtraE then
-        logDebug("ExtraE pressed", true)
-    end
-    debugPrevExtraE = thisCar.extraE
-
-    if thisCar.extraF and not debugPrevExtraF then
-        logDebug("ExtraF pressed", true)
-    end
-    debugPrevExtraF = thisCar.extraF
-
-    if thisCar.handbrake == 1 and not debugPrevHandbrake then
-        logDebug("Handbrake engaged", true)
-    end
-    debugPrevHandbrake = (thisCar.handbrake == 1)
+    cvrPitCrewFuelStatusConnection.carIndex = thisCar.index or 0
+    cvrPitCrewFuelStatusConnection.available = true
+    cvrPitCrewFuelStatusConnection.tankLeaking = fuelLeakageDamage == true
 end
 
-local function logCarEnterAndLeavePits()
-    if isCarInPits and not debugPrevInPits then
-        logDebug("Enter pits", true)
-    end
-    if not isCarInPits and debugPrevInPits then
-        logDebug("Exit pits", true)
-        logStaticInfo()
+local function getAirCoolingPitRepairEstimate()
+    if airCoolingStatus == AIR_COOLING_STATUS_FAN_SHROUD_DAMAGED then
+        return ((airCoolingFanShroudPitRepairTimeMinSeconds or 0)
+            + (airCoolingFanShroudPitRepairTimeMaxSeconds or 0)) * 0.5
     end
 
-    debugPrevInPits = isCarInPits
+    return ((airCoolingBeltPitRepairTimeMinSeconds or 0)
+        + (airCoolingBeltPitRepairTimeMaxSeconds or 0)) * 0.5
 end
 
------------------ End of debug/testing code -----------------
+local function getElectricalIssueMask()
+    if ignitionType ~= 2 and ignitionType ~= 3 then
+        return 0
+    end
 
-local fuelExhCutTimer = 0
+    local mask = 0
+    if (batteryMaxCapacity or 100) < 75 then
+        mask = mask + 1
+    end
+    if (alternatorHealth or 1) < 0.9 then
+        mask = mask + 2
+    end
+    -- A shared fan/generator belt is one electrical service item. A slipping
+    -- belt can still charge weakly, so it needs to be reported even before the
+    -- alternator model marks charging as fully failed.
+    if alternatorOK == false
+        or (needsAirCoolingSharedBeltService and needsAirCoolingSharedBeltService()) then
+        mask = mask + 4
+    end
+    return mask
+end
+
+local function hasOilPressureFaultForPitCrew()
+    return oilPressurePumpDamaged == true
+        or oilPressureFailed == true
+        or oilPressureFailureActive == true
+        or oilPressureDamageActive == true
+end
+
+local function updateCVRPitCrewServiceStatus()
+    if not cvrPitCrewServiceStatusConnection then
+        return
+    end
+
+    local fouledSparkPlugs = getFouledSparkPlugCount and getFouledSparkPlugCount() or 0
+    cvrPitCrewServiceStatusConnection.carIndex = thisCar.index or 0
+    cvrPitCrewServiceStatusConnection.available = true
+    cvrPitCrewServiceStatusConnection.brakeFailure = brakesFailed == true
+    cvrPitCrewServiceStatusConnection.alternatorSeconds = math.max(0, (alternatorRepairTime or 0) * 0.5)
+    cvrPitCrewServiceStatusConnection.fuelPumpSeconds = math.max(0, fuelPumpRepairTime or 0)
+    cvrPitCrewServiceStatusConnection.sparkPlugsSeconds = fouledSparkPlugs > 0
+        and math.max(0, (sparkPlugPitChangeFirstPlugSeconds or 0)
+            + (fouledSparkPlugs - 1) * (sparkPlugPitChangeAdditionalPlugSeconds or 0))
+        or 0
+    cvrPitCrewServiceStatusConnection.gearboxSeconds = math.max(0, gearboxRepairTime or 0)
+    cvrPitCrewServiceStatusConnection.oilSeconds = math.max(0, oilPitRefillTimeSeconds or 0)
+    cvrPitCrewServiceStatusConnection.airCoolingSeconds = math.max(0, getAirCoolingPitRepairEstimate())
+    cvrPitCrewServiceStatusConnection.airCoolingFanDriveType = (isAirCoolingSystemEnabled and isAirCoolingSystemEnabled()
+        and getAirCoolingFanDriveType and getAirCoolingFanDriveType()) or 0
+    cvrPitCrewServiceStatusConnection.electricalIssueMask = getElectricalIssueMask()
+    cvrPitCrewServiceStatusConnection.oilPressureFault = hasOilPressureFaultForPitCrew()
+    cvrPitCrewServiceStatusConnection.valveFailure = valveFailed == true or valveFailureActive == true
+    cvrPitCrewServiceStatusConnection.sparkPlugFailure = fouledSparkPlugs > 0
+    cvrPitCrewServiceStatusConnection.tyreSeconds = getCVRPitCrewTyreChangeTime
+        and math.max(0, getCVRPitCrewTyreChangeTime(1)) or 0
+    cvrPitCrewServiceStatusConnection.tyreChangesCanRunWithRepairs = pitTyreChangesCanRunWithRepairs ~= false
+end
+
+local function pitRepairQueueIsActive()
+    return pitRepairQueueIndex > 0 and pitRepairQueueIndex <= #pitRepairQueue
+end
+
+function isCustomPitRepairQueueActive()
+    return pitRepairQueueIsActive()
+end
+
+function isPitRepairQueueCurrent(repairType)
+    return pitRepairQueueIsActive() and pitRepairQueue[pitRepairQueueIndex] == repairType
+end
+
+function completePitRepairQueueItem(repairType)
+    if not isPitRepairQueueCurrent(repairType) then
+        return
+    end
+
+    pitRepairQueueIndex = pitRepairQueueIndex + 1
+    if not pitRepairQueueIsActive() then
+        pitRepairQueue = {}
+        pitRepairQueueIndex = 0
+        overheadMessageQueue("Pit repairs", "Service queue complete", 3, true)
+    end
+end
+
+resetPitRepairQueue = function()
+    pitRepairQueue = {}
+    pitRepairQueueIndex = 0
+    prevPitRepairButtonState = false
+end
+
+local function queuePitRepair(repairType)
+    pitRepairQueue[#pitRepairQueue + 1] = repairType
+end
+
+local function repairMaskHas(mask, bit)
+    return math.floor((mask or 0) / bit) % 2 == 1
+end
+
+local function queueSelectedPitRepair(bit, mask, repairType, needsRepair)
+    if repairMaskHas(mask, bit) and needsRepair then
+        queuePitRepair(repairType)
+        return bit
+    end
+
+    return 0
+end
+
+local function getNeededPitRepairMask()
+    local mask = 0
+    if needsAlternatorPitRepair() then
+        mask = mask + CVR_PIT_REPAIR_ALTERNATOR
+    end
+    if needsFuelPumpPitRepair() then
+        mask = mask + CVR_PIT_REPAIR_FUEL_PUMP
+    end
+    if needsSparkPlugPitRepair() then
+        mask = mask + CVR_PIT_REPAIR_SPARK_PLUGS
+    end
+    if isAnyGearBrokenForPitRepair() then
+        mask = mask + CVR_PIT_REPAIR_GEARBOX
+    end
+    if needsOilPitRefill() then
+        mask = mask + CVR_PIT_REPAIR_OIL
+    end
+    if needsAirCoolingPitRepair and needsAirCoolingPitRepair() then
+        mask = mask + CVR_PIT_REPAIR_AIR_COOLING
+    end
+    return mask
+end
+
+local function firstMaskBit(mask)
+    local bit = 1
+    while bit <= 128 do
+        if repairMaskHas(mask, bit) then
+            return bit
+        end
+        bit = bit * 2
+    end
+    return 0
+end
+
+local function intersectRepairMasks(firstMask, secondMask)
+    local intersection = 0
+    local bit = 1
+    while bit <= 128 do
+        if repairMaskHas(firstMask, bit) and repairMaskHas(secondMask, bit) then
+            intersection = intersection + bit
+        end
+        bit = bit * 2
+    end
+    return intersection
+end
+
+local function getCVRPitCrewRoadsideTyreMask()
+    local mask = 0
+    if currentSpares == 0 then
+        return mask
+    end
+    for tyreIndex = 0, 3 do
+        if thisCar.wheels[tyreIndex].isBlown or (tyrePunctureDeflateFactor[tyreIndex] or 0) > 0 then
+            mask = mask + 2 ^ tyreIndex
+        end
+    end
+    return mask
+end
+
+local function getCVRPitCrewRoadsideRepairMask()
+    local mask = 0
+    if (not alternatorOK) or (needsAirCoolingSharedBeltService and needsAirCoolingSharedBeltService()) then
+        mask = mask + CVR_ROADSIDE_REPAIR_ELECTRICITY
+    end
+    if getFouledSparkPlugCount and getFouledSparkPlugCount() > 0 then
+        mask = mask + CVR_ROADSIDE_REPAIR_SPARK_PLUGS
+    end
+    if airCoolingUsesFanBelt and airCoolingUsesFanBelt()
+            and not (airCoolingSharesGeneratorBelt and airCoolingSharesGeneratorBelt())
+            and (airCoolingStatus == AIR_COOLING_STATUS_BELT_SLIPPING
+                or airCoolingStatus == AIR_COOLING_STATUS_BELT_BROKEN) then
+        mask = mask + CVR_ROADSIDE_REPAIR_AIR_COOLING
+    end
+    return mask
+end
+
+function isCVRPitCrewRoadsideTyreRequested(tyreIndex)
+    return repairMaskHas(cvrPitCrewRoadsideActiveTyreMask, 2 ^ tyreIndex)
+end
+
+function isCVRPitCrewRoadsideRepairRequested(repairBit)
+    return repairMaskHas(cvrPitCrewRoadsideActiveRepairMask, repairBit)
+end
+
+function beginCVRPitCrewRoadsideService()
+    if cvrPitCrewRoadsideConnection
+            and (cvrPitCrewRoadsideActiveTyreMask > 0 or cvrPitCrewRoadsideActiveRepairMask > 0) then
+        cvrPitCrewRoadsideConnection.state = CVR_ROADSIDE_STATE_WORKING
+    end
+end
+
+function completeCVRPitCrewRoadsideTyreService(tyreIndex)
+    if not isCVRPitCrewRoadsideTyreRequested(tyreIndex) then
+        return
+    end
+
+    cvrPitCrewRoadsideActiveTyreMask = 0
+    if cvrPitCrewRoadsideConnection then
+        cvrPitCrewRoadsideConnection.state = CVR_ROADSIDE_STATE_COMPLETE
+    end
+end
+
+function completeCVRPitCrewRoadsideRepairService(repairBit)
+    if not isCVRPitCrewRoadsideRepairRequested(repairBit) then
+        return
+    end
+
+    cvrPitCrewRoadsideActiveRepairMask = 0
+    if cvrPitCrewRoadsideConnection then
+        cvrPitCrewRoadsideConnection.state = CVR_ROADSIDE_STATE_COMPLETE
+    end
+end
+
+function cancelCVRPitCrewRoadsideService()
+    if cvrPitCrewRoadsideActiveTyreMask == 0 and cvrPitCrewRoadsideActiveRepairMask == 0 then
+        return
+    end
+
+    cvrPitCrewRoadsideActiveTyreMask = 0
+    cvrPitCrewRoadsideActiveRepairMask = 0
+    if cvrPitCrewRoadsideConnection then
+        cvrPitCrewRoadsideConnection.state = CVR_ROADSIDE_STATE_REJECTED
+    end
+end
+
+function resetCVRPitCrewRoadsideServiceState()
+    cvrPitCrewRoadsideActiveTyreMask = 0
+    cvrPitCrewRoadsideActiveRepairMask = 0
+    if cvrPitCrewRoadsideConnection then
+        cvrPitCrewRoadsideLastRequestId = tonumber(cvrPitCrewRoadsideConnection.requestId) or 0
+        cvrPitCrewRoadsideConnection.tyreMask = 0
+        cvrPitCrewRoadsideConnection.repairMask = 0
+        cvrPitCrewRoadsideConnection.state = CVR_ROADSIDE_STATE_READY
+    end
+end
+
+local function updateCVRPitCrewRoadsideService()
+    if not cvrPitCrewRoadsideConnection then
+        return
+    end
+
+    local connection = cvrPitCrewRoadsideConnection
+    connection.carIndex = thisCar.index or 0
+    connection.available = true
+    connection.availableTyreMask = getCVRPitCrewRoadsideTyreMask()
+    connection.availableRepairMask = getCVRPitCrewRoadsideRepairMask()
+
+    if isCarInPits then
+        cancelCVRPitCrewRoadsideService()
+        connection.state = CVR_ROADSIDE_STATE_READY
+        return
+    end
+
+    local speedKmh = thisCar.speedKmh or 0
+    if (cvrPitCrewRoadsideActiveTyreMask > 0 or cvrPitCrewRoadsideActiveRepairMask > 0)
+            and speedKmh > 2 then
+        cancelCVRPitCrewRoadsideService()
+        return
+    end
+
+    if cvrPitCrewRoadsideActiveTyreMask > 0 or cvrPitCrewRoadsideActiveRepairMask > 0 then
+        return
+    end
+
+    local requestId = tonumber(connection.requestId) or 0
+    if requestId == 0 or requestId == cvrPitCrewRoadsideLastRequestId then
+        return
+    end
+    cvrPitCrewRoadsideLastRequestId = requestId
+
+    local requestedTyres = firstMaskBit(intersectRepairMasks(
+        tonumber(connection.tyreMask) or 0, tonumber(connection.availableTyreMask) or 0))
+    local requestedRepairs = firstMaskBit(intersectRepairMasks(
+        tonumber(connection.repairMask) or 0, tonumber(connection.availableRepairMask) or 0))
+    if speedKmh >= 1 or (requestedTyres == 0 and requestedRepairs == 0)
+            or (requestedTyres > 0 and requestedRepairs > 0) then
+        connection.state = CVR_ROADSIDE_STATE_REJECTED
+        return
+    end
+
+    cvrPitCrewRoadsideActiveTyreMask = requestedTyres
+    cvrPitCrewRoadsideActiveRepairMask = requestedRepairs
+    connection.state = CVR_ROADSIDE_STATE_ARMED
+end
+
+local function updateCVRPitCrewRepairStatus()
+    if not cvrPitCrewRepairConnection or cvrPitCrewActiveRepairRequestId == 0 or pitRepairQueueIsActive() then
+        return
+    end
+
+    cvrPitCrewRepairConnection.appliedRepairRequestId = cvrPitCrewActiveRepairRequestId
+    cvrPitCrewRepairConnection.appliedRepairMask = cvrPitCrewActiveRepairMask
+    cvrPitCrewRepairConnection.repairStatus = cvrPitCrewActiveRepairMask > 0 and 1 or 2
+    cvrPitCrewActiveRepairRequestId = 0
+    cvrPitCrewActiveRepairMask = 0
+end
+
+local function updateCVRPitCrewRepairQueue()
+    updateCVRPitCrewOilStatus()
+    updateCVRPitCrewFuelStatus()
+    updateCVRPitCrewServiceStatus()
+
+    if not cvrPitCrewRepairConnection then
+        return
+    end
+
+    cvrPitCrewRepairConnection.repairNeededMask = getNeededPitRepairMask()
+
+    if not isCarInPits then
+        cvrPitCrewRepairConnection.repairStatus = 0
+        cvrPitCrewActiveRepairRequestId = 0
+        cvrPitCrewActiveRepairMask = 0
+        cvrPitCrewLastRepairRequestId = 0
+        return
+    end
+
+    updateCVRPitCrewRepairStatus()
+
+    if pitRepairQueueIsActive() or cvrPitCrewActiveRepairRequestId ~= 0
+            or (pitTyreChangesCanRunWithRepairs == false
+                and isCVRPitCrewTyreServiceActive and isCVRPitCrewTyreServiceActive()) then
+        return
+    end
+
+    local requestId = tonumber(cvrPitCrewRepairConnection.repairRequestId) or 0
+    local repairMask = tonumber(cvrPitCrewRepairConnection.repairMask) or 0
+    if requestId == 0 or requestId == cvrPitCrewLastRepairRequestId or repairMask == 0 then
+        return
+    end
+
+    pitRepairQueue = {}
+    pitRepairQueueIndex = 0
+    local appliedMask = 0
+
+    appliedMask = appliedMask + queueSelectedPitRepair(CVR_PIT_REPAIR_ALTERNATOR, repairMask, PIT_REPAIR_ALTERNATOR, needsAlternatorPitRepair())
+    appliedMask = appliedMask + queueSelectedPitRepair(CVR_PIT_REPAIR_FUEL_PUMP, repairMask, PIT_REPAIR_FUEL_PUMP, needsFuelPumpPitRepair())
+    appliedMask = appliedMask + queueSelectedPitRepair(CVR_PIT_REPAIR_SPARK_PLUGS, repairMask, PIT_REPAIR_SPARK_PLUGS, needsSparkPlugPitRepair())
+    appliedMask = appliedMask + queueSelectedPitRepair(CVR_PIT_REPAIR_GEARBOX, repairMask, PIT_REPAIR_GEARBOX, isAnyGearBrokenForPitRepair())
+    appliedMask = appliedMask + queueSelectedPitRepair(CVR_PIT_REPAIR_OIL, repairMask, PIT_REPAIR_OIL, needsOilPitRefill())
+    appliedMask = appliedMask + queueSelectedPitRepair(CVR_PIT_REPAIR_AIR_COOLING, repairMask, PIT_REPAIR_AIR_COOLING, needsAirCoolingPitRepair and needsAirCoolingPitRepair())
+
+    cvrPitCrewLastRepairRequestId = requestId
+    cvrPitCrewActiveRepairRequestId = requestId
+    cvrPitCrewActiveRepairMask = appliedMask
+    cvrPitCrewRepairConnection.appliedRepairRequestId = 0
+    cvrPitCrewRepairConnection.appliedRepairMask = appliedMask
+
+    if appliedMask > 0 then
+        pitRepairQueueIndex = 1
+        cvrPitCrewRepairConnection.repairStatus = 3
+        overheadMessageQueue("Pit repairs", "Selected service queue started", 3, true)
+    else
+        cvrPitCrewRepairConnection.appliedRepairRequestId = requestId
+        cvrPitCrewRepairConnection.repairStatus = 2
+        cvrPitCrewActiveRepairRequestId = 0
+    end
+end
+
+local function updatePitRepairQueue()
+    if not isCarInPits then
+        resetPitRepairQueue()
+        updateCVRPitCrewRepairQueue()
+        return
+    end
+
+    updateCVRPitCrewRepairQueue()
+
+    if pitRepairQueueIsActive()
+            or (pitTyreChangesCanRunWithRepairs == false
+                and isCVRPitCrewTyreServiceActive and isCVRPitCrewTyreServiceActive()) then
+        return
+    end
+
+    if thisCar.extraB and not prevPitRepairButtonState then
+        pitRepairQueue = {}
+        pitRepairQueueIndex = 0
+
+        if needsAlternatorPitRepair() then
+            queuePitRepair(PIT_REPAIR_ALTERNATOR)
+        end
+        if needsFuelPumpPitRepair() then
+            queuePitRepair(PIT_REPAIR_FUEL_PUMP)
+        end
+        if needsSparkPlugPitRepair() then
+            queuePitRepair(PIT_REPAIR_SPARK_PLUGS)
+        end
+        if isAnyGearBrokenForPitRepair() then
+            queuePitRepair(PIT_REPAIR_GEARBOX)
+        end
+        if needsOilPitRefill() then
+            queuePitRepair(PIT_REPAIR_OIL)
+        end
+        if needsAirCoolingPitRepair and needsAirCoolingPitRepair() then
+            queuePitRepair(PIT_REPAIR_AIR_COOLING)
+        end
+
+        if #pitRepairQueue > 0 then
+            pitRepairQueueIndex = 1
+            overheadMessageQueue("Pit repairs", "Service queue started", 3, true)
+        end
+    end
+
+    prevPitRepairButtonState = thisCar.extraB
+end
 
 -- MAIN UPDATE STARTS
 function update(dt)
-    if acCarPhysics.inputMethod == ac.InputMethod.AI then
+    if isAICar then
+        updateAIFailureSystem(dt)
         return
     end
+
+    inGrid = (ac.getSim().raceSessionType == ac.SessionType.Race and not ac.getSim().isSessionStarted)
+    updateLastCarWorldPosition()
+
+    if thisCar.isInPit or inGrid or (dt < 0.0001) or ac.getSim().isInMainMenu or ac.getSim().isPaused then
+        ac.ControlButton("__EXT_ENGINEMAP_UP"):setDisabled(false)
+    end
+
     if currentSpares ~= 0 then
         tyreStockEmpty = false
     end
     if TEST_CODE then
+        updateScriptSetupToggles()
         selectFailureForTesting()
         setFailureForTesting()
     end
 
-    if thisCar.isInPitlane then
-        if thisCar.isInPit then
-            isCarInPits = true
-        end
-    else
-        isCarInPits = false
-    end
+    -- Pit crew work is allowed only while physically in the pit box. The old
+    -- latched value remained true through the rest of the pit lane.
+    isCarInPits = thisCar.isInPit and true or false
     printDebug("isCarInPits", isCarInPits)
+    updateCVRPitCrewRoadsideService()
 
-    -- Uncomment below once you have throttle model lua in place
-    --if ac.getSim().inputMode ~= ac.UserInputMode.Keyboard then
-    --    switch_throttle_model.runThrottleModel()
-    --end
+    if ac.getSim().inputMode == ac.UserInputMode.Wheel
+            and acCarPhysics.inputMethod == ac.InputMethod.Wheel then
+        new_throttle_model.runTM()
+    end
+    applyEngineTemperaturePower(dt)
 
     logExtraButtonPresses()
     logCarEnterAndLeavePits()
+    updatePitRepairQueue()
+    if DEBUG then
+        updateZeroToHundredDebugTimer(dt)
+    end
+
+    if not (thisCar.isInPit or inGrid or (dt < 0.0001) or ac.getSim().isInMainMenu or ac.getSim().isPaused) then
+        rescue.update(dt)
+    end
 
     optimizationTimer = optimizationTimer + dt
 
     brakeWear(dt)
     fuelPumpFailure(dt)
-    setupBits()
+    updateSparkPlugPowerLoss()
+    updateFuelTankPressurization(dt)
+    setupBits(dt)
+    updateCVRPitCrewTyreOverrides()
     coolantBehavior(dt)
+    updateAirCoolingSystem(dt)
+    updateEngineCrashFire(dt)
     tyreReplacement(dt)
     overheadMessageDisplay(dt)
     engineStaller(dt)
+    updateOilPressureSystem(dt)
+    updateDoubleClutchGearbox(dt)
+    updateDogboxGearbox(dt)
 
-    if (ignitionType == 2) or (ignitionType == 3) then       
-    
+    if (ignitionType == 2) or (ignitionType == 3) then
+
         updateElectricity(dt)
         handleRepairs(dt, overheadMessageQueue)
-        
+
         debugElectricity(dt)  -- <-- added
 
-        if thisCar.isInPit and (batteryCurrentCharge < 95 or batteryMaxCapacity < 95 or alternatorHealth < 0.9 or not alternatorOK) then
-            -- Check if Extra B is pressed
-            if thisCar.extraB and not isRepairingBelt then
+        if thisCar.isInPit and isPitRepairQueueCurrent(PIT_REPAIR_ALTERNATOR) then
+            if not needsAlternatorPitRepair() then
+                isRepairingBelt = false
+                beltRepairTimer = 0
+                acCarPhysics.controllerInputs[52] = 0
+                completePitRepairQueueItem(PIT_REPAIR_ALTERNATOR)
+            elseif not isRepairingBelt then
                 isRepairingBelt = true
                 beltRepairTimer = 0  -- Reset timer when repair starts
-                overheadMessageQueue("Alternator Repair", "Repair started. Hold position until done", 3)
-                printDebug("Alternator Repair", "Repair process started")
+                overheadMessageQueue("Electricity", "Service started. Hold position until done", 3, true)
+                printDebug("Electricity", "Repair process started")
             end
 
             -- If repair is in progress, count time
@@ -1814,25 +1345,39 @@ function update(dt)
 
                 -- todo: adjust batteryMaxCapacity based on what is the problem. new battery - for simplicity I'll just assume they check and replace everything
 
-                -- Show repair progress - repairing the alternator in the pits only takes half as long
-                overheadMessageQueue("ELECTRICITY", "Repairing alternator: " .. string.format("%d%%", math.floor((beltRepairTimer / (alternatorRepairTime/2)) * 100)) .. " done", 1, true)
-                printDebug("Alternator Repair Progress", string.format("%.1f sec left", (alternatorRepairTime/2) - beltRepairTimer))
+                -- Keep repair progress on the single queued overhead channel.
+                overheadMessageQueue(
+                    "Electricity",
+                    "Progress: " .. string.format("%d%%", math.floor((beltRepairTimer / (alternatorRepairTime / 2)) * 100)),
+                    1,
+                    true)
+                printDebug("Electricity progress", string.format("%.1f sec left", (alternatorRepairTime/2) - beltRepairTimer))
 
                 -- When repair time has passed, complete the repair
                 if beltRepairTimer >= (alternatorRepairTime/2) then
                     alternatorOK = true
-                    alternatorHealth = math.min((alternatorHealth or 0) + 0.5, 1.0) --? why not just 1?
+                    alternatorHealth = 1.0
+                    if repairAirCoolingSharedBelt then
+                        repairAirCoolingSharedBelt()
+                    end
                     beltRepairTimer = 0
                     isRepairingBelt = false
                     acCarPhysics.controllerInputs[52] = 0
                     alternatorRepairTime = math.random(100, 200)
                     batteryCurrentCharge = 100
                     batteryMaxCapacity = 100
-                    overheadMessageQueue("ELECTRICITY", "The Alternator has been repaired", 3)
+                    overheadMessageQueue("Electricity", "Service complete", 3, true)
+                    completePitRepairQueueItem(PIT_REPAIR_ALTERNATOR)
                 end
             end
+        elseif isRepairingBelt then
+            isRepairingBelt = false
+            beltRepairTimer = 0
+            acCarPhysics.controllerInputs[52] = 0
         end
     end
+
+    sparkPlugRoadsideRepair(dt)
 
     mediumSpeedDtTimer = mediumSpeedDtTimer + dt
 
@@ -1845,7 +1390,7 @@ function update(dt)
 
     if fuelExhCutLength > 0 then
         if fuelExhCutTimer < fuelExhCutLength then
-            acCarPhysics.gas = math.random() * 0.2
+            acCarPhysics.gas = math.min(acCarPhysics.gas or 0, math.random() * 0.2)
             fuelExhCutTimer = fuelExhCutTimer + dt
         else
             fuelExhCutLength = 0
@@ -1857,7 +1402,9 @@ function update(dt)
         turboFailureTimer = turboFailureTimer + dt
 
         if not isCarInPits and turboFailureTimer >= 1 then
-            updateTurboState(logDebug)
+            if (acCarPhysics.rpm > 100) then
+                updateTurboState(logDebug)
+            end
             if isTurboFailureEngineOverheatingActive() then
                 currentEngineHeatGainMult = engineHeatGainMultTurbo
                 printDebug("Turbo", "Engine overheating active")
@@ -1888,8 +1435,16 @@ function update(dt)
         prevExtraDState = thisCar.extraD
     end
 
+    -- enable/disable remote fuel mix change based on flags (move to optimizeTimer part maybe?)
+    if remFlags.fuelMix or thisCar.isInPit or inGrid or (dt < 0.0001) or ac.getSim().isInMainMenu or ac.getSim().isPaused then
+        ac.ControlButton("__EXT_ENGINEMAP_UP"):setDisabled(false)
+    else
+        ac.ControlButton("__EXT_ENGINEMAP_UP"):setDisabled(true)
+    end
+    --
+
     -- radiator setup
-    if radiatorShutterAdjustEnabled then
+    if radiatorShutterAdjustEnabled and ((remFlags.radiatorShutter) or thisCar.isInPit) then
         if thisCar.extraE and not prevextraEState then
             radiatorSetup = (radiatorSetup + 1) % 5
         end
@@ -1898,9 +1453,9 @@ function update(dt)
         end
         if radiatorSetup ~= prevRadiatorSetup then
             local shutterMsg = applyRadiatorSetup(radiatorSetup)
-            overheadMessageQueue("Radiator setup", shutterMsg, 3, true)
-            printDebug("Radiator setup", tostring(radiatorSetup))
-            logDebug("Radiator setup: ", tostring(radiatorSetup))
+            overheadMessageQueue(getCoolingSetupTitle(), shutterMsg, 3, true)
+            printDebug(getCoolingSetupTitle(), tostring(radiatorSetup))
+            logDebug(getCoolingSetupTitle(), ": ", tostring(radiatorSetup))
         end
         prevextraEState = thisCar.extraE
         prevextraFState = thisCar.extraF
@@ -1909,7 +1464,8 @@ function update(dt)
 
     failureRateHandlingTimer = failureRateHandlingTimer + dt
 
-    if failureRateHandlingTimer >= failureRateHandlingInterval and thisCar.speedKmh > 1 then
+    local physicsSpeedKmh = acCarPhysics.speedKmh or thisCar.speedKmh or 0
+    if failureRateHandlingTimer >= failureRateHandlingInterval and physicsSpeedKmh > 1 then
         local rates = {
             sparkPlug = sparkPlugFailureRateBase,
             fuelPump = fuelPumpFailureRateBase,
@@ -1917,13 +1473,19 @@ function update(dt)
             oilPressure = oilPressureFailureRateBase
         }
 
-        local rpmRounded = math.floor(thisCar.rpm + 0.5)
+        local rpmRounded = math.floor((acCarPhysics.rpm or thisCar.rpm or 0) + 0.5)
         handleOverrevving(rates, rpmRounded)
         local lowRpm = handleLowRpm(rates, rpmRounded)
-        local runningCloseStep = handleRunningCloseToCarInFront(rates, thisCar.speedKmh, ac)
-        handleHighCoolantTemp(rates, coolantTemp)
+        local runningCloseStep = handleRunningCloseToCarInFront(rates, physicsSpeedKmh, ac)
+        handleHighCoolantTemp(rates, getThermalStressTemperature())
         handleRunningTankLow(rates, thisCar.fuel)
-        radiatorCoolCoefficient = handleRadiatorEfficiency(radiatorCoolCoefficientBase, lowRpm, runningCloseStep, trackSurfaceType, thisCar.fuelMap + 1)
+        radiatorCoolCoefficient = handleRadiatorEfficiency(
+            radiatorCoolCoefficientBase,
+            lowRpm,
+            runningCloseStep,
+            trackSurfaceType,
+            physicsSpeedKmh,
+            failureRateHandlingInterval)
 
         sparkPlugFailureRateBase = rates.sparkPlug
         fuelPumpFailureRateBase = rates.fuelPump
@@ -1955,18 +1517,24 @@ function update(dt)
         end
     end
 
+    if fuelPumpRepairInProgress or gearboxRepairInProgress or oilPitRefillInProgress
+            or sparkPlugRepairInProgress or sparkPlugRoadsideRepairInProgress
+            or isRepairingBelt or airCoolingPitRepairInProgress or airCoolingRoadsideRepairInProgress
+            or thisCar.isRepairing then
+        ac.setEngineRPM(0)
+    end
+
     --run some bits only every few ticks, no point in checking them every tick.
     if optimizationTimer > 2 then
-    --setExtraMass call is free if the position and mass is the same as last call, so this is fine here.
-
+        --setExtraMass call is free if the position and mass is the same as last call, so this is fine here.
+        
         if currentSpares > 0 then
             local currentSparesBugfix = currentSpares + 0.1
             ac.setExtraMass(spareWheelPos, currentSparesBugfix * spareWheelMass, vec3(0.05,0.05,0.05))
         end
-        
+
         -- Prior starting the race, reset all possible failures and wear
         -- accumulated in previous (practice) sessions.
-        local inGrid = (ac.getSim().raceSessionType == ac.SessionType.Race and not ac.getSim().isSessionStarted)
         if inGrid then
             if not doOnceAtStart then
                 resetCar()
@@ -1975,7 +1543,9 @@ function update(dt)
             end
         else
             tyreBlow()
-            fuelPumpFailureActivation()
+            if (acCarPhysics.rpm > 100) then
+                fuelPumpFailureActivation()
+            end
             updateTyreWear()
         end
 
@@ -1988,11 +1558,15 @@ function update(dt)
 
         -- Only run failure checks when NOT in repair state
         if not gearboxRepairInProgress and not isCarInPits and not inGrid then
-            sparkPlugFailure()
-            valveFailure(dt)
-            oilPressureFailure(dt)
-            gearboxFailure()
-            fuelTankDamage()
+            if (acCarPhysics.rpm > 100) then
+                sparkPlugFailure()
+                valveFailure(dt)
+                oilPressureFailure(dt)
+                if not ac.getSim().controlsWithShifter then  -- added so the old method runs for paddle shifters only
+                    gearboxFailure()
+                end
+            end
+            --fuelTankDamage() -- once should be enough an it'S already being called right below
         end
 
         fuelTankDamage()
@@ -2004,95 +1578,21 @@ function update(dt)
         local gearboxDamage = deadGearCount / thisCar.gearCount
         updateGearFailureRate(gearboxDamage)
 
-        -- If repairs are on going then force engine off.
-        if fuelPumpRepairInProgress or gearboxRepairInProgress or isRepairingBelt then
-            ac.setEngineRPM(0)
-        end
-
         optimizationTimer = 0
     end
 
-    if isCarInPits and fuelPumpFailed then
-        -- Check if Extra B is pressed
-        if thisCar.extraB and not fuelPumpRepairInProgress then
-            fuelPumpRepairInProgress = true
-            fuelPumpPitTimer = 0  -- Reset timer when repair starts
-            overheadMessageQueue("Fuel Pump Repair", "Repair started. Hold position until done", 3)
-            printDebug("Fuel Pump Repair", "Repair process started")
-        end
-
-        -- If repair is in progress, count time
-        if fuelPumpRepairInProgress then
-            fuelPumpPitTimer = fuelPumpPitTimer + dt
-
-            -- Show repair progress
-            --ac.setSystemMessage("Fuel Pump Repair", string.format("Time left: %.1f sec", math.max(0, fuelPumpRepairTime - fuelPumpPitTimer)))
-            ac.setSystemMessage("Fuel Pump Repair",
-                    string.format("Progress: %.1f%%",
-                    (fuelPumpPitTimer/fuelPumpRepairTime)*100))
-            printDebug("Fuel Pump Repair Progress", string.format("%.1f sec left", fuelPumpRepairTime - fuelPumpPitTimer))
-
-            -- When repair time has passed, complete the repair
-            if fuelPumpPitTimer >= fuelPumpRepairTime then
-                fuelPumpFailed = false
-                fuelPumpRepairInProgress = false
-                fuelPumpPitTimer = 0
-                fuelPumpRepairTime = math.random(30, 180)
-
-                -- Reset failure rates to initial values, as the pump has been fixed.
-                fuelPumpFailureRate = fuelPumpFailureRateInitialValue
-                fuelPumpFailureRateBase = fuelPumpFailureRateInitialValue
-
-                overheadMessageQueue("Fuel Pump Repaired", "You're good to go!", 3)
-                printDebug("Fuel Pump Repair", "Repair complete!")
-            end
-        end
-    else
-        -- Reset if car leaves pits
-        fuelPumpRepairInProgress = false
-        fuelPumpPitTimer = 0
+    -- new h-shifter gearbox failure system. Based on gearGrind state. needs to be outside of the optimization timer because otherwise one would potentially miss the window where this should apply
+    if (thisCar.isGearGrinding or isDoubleClutchGearGrinding()) and ac.getSim().controlsWithShifter then  -- added so the old method runs for paddle shifters only
+        gearboxFailureHshifter(dt)
     end
 
-    -- Simulate gear failure by cutting throttle
-    local currentGearIndex = getCurrentGearIndex()
-    if currentGearIndex > 0 and deadGears[currentGearIndex] then
-        acCarPhysics.clutch = 0.1 + math.random() * 0.4  -- Generates a value between 0.1 and 0.6 - Fuck up failed gears
-        --overheadMessageQueue("Gear failure", "Gear "..(currentGearIndex).." is broken!", 3)
-    end
+    fuelPumpPitRepair(dt)
 
-    -- Gearbox Repair Logic (new)
-    if isCarInPits and not fuelPumpRepairInProgress then
-        local needsRepair = false
-        for i = 1, thisCar.gearCount do
-            if deadGears[i] then
-                needsRepair = true
-                break
-            end
-        end
+    sparkPlugPitRepair(dt)
 
-        if needsRepair then
-            if thisCar.extraB and not gearboxRepairInProgress then
-                gearboxRepairInProgress = true
-                gearboxPitTimer = 0
-                overheadMessageQueue("Gearbox Repair", "Repair started. Hold position!", 3)
-            end
+    gearboxPitRepair(dt)
 
-            if gearboxRepairInProgress then
-                gearboxPitTimer = gearboxPitTimer + dt
-                ac.setSystemMessage("Gearbox Repair",
-                    string.format("Progress: %.1f%%",
-                    (gearboxPitTimer/gearboxRepairTime)*100))
-
-                -- Complete repair
-                if gearboxPitTimer >= gearboxRepairTime then
-                    initDeadGears()
-                    gearboxRepairInProgress = false
-                    gearboxRepairTime = math.random(30, 180)
-                    overheadMessageQueue("GEARBOX REPAIRED", "All gears restored!", 5)
-                end
-            end
-        end
-    end
+    oilPressureSystemPitRefill(dt)
 
     -- Limit the minimum failure rates.
     if sparkPlugFailureRateBase < sparkPlugFailureRateMinimumValue then
@@ -2116,7 +1616,33 @@ function update(dt)
 
         printDebug("Extra Buttons", string.format("A: %s | B: %s", tostring(thisCar.extraA), tostring(thisCar.extraB)))
 
-        printDebug("Radiator", string.format("Damage: %.1f | Coolant: %.1f°C | Engine: %.1f°C", carDamageClamp, coolantTemp, engineTemp))
+        printDebug("Cooling", string.format(
+            "Damage: %.1f | Display temp: %.1f°C | Engine: %.1f°C | Clog: %.1f%% | Clog cooling loss: %.1f%%",
+            carDamageClamp,
+            coolantTemp,
+            engineTemp,
+            (radiatorDustClogLevel or 0) * 100,
+            (radiatorDustClogLevel or 0) * (radiatorDustClogMaxCoolingLoss or 0) * 100))
+        printDebug("Thermal low RPM cooling", string.format("%.2f", tonumber(thermalLowRpmCoolingMultiplier) or 1))
+        printDebug("Air cooling", string.format(
+            "Type: %s | Drive: %s | Status: %s | Fan eff: %.0f%% | Gen eff: %.0f%% | Stress: %.2f | Repair: %s %.0f%%",
+            (isAirCoolingSystemEnabled and isAirCoolingSystemEnabled()) and "Air" or "Radiator",
+            getAirCoolingFanDriveDescription and getAirCoolingFanDriveDescription() or "N/A",
+            getAirCoolingStatusDescription and getAirCoolingStatusDescription() or "N/A",
+            ((getAirCoolingFanEfficiency and getAirCoolingFanEfficiency()) or 1) * 100,
+            ((getAirCoolingGeneratorEfficiency and getAirCoolingGeneratorEfficiency()) or 1) * 100,
+            tonumber(airCoolingBeltStress) or 0,
+            tostring((airCoolingPitRepairInProgress or airCoolingRoadsideRepairInProgress) == true),
+            ((airCoolingRepairTime or 0) > 0 and math.clamp((airCoolingRepairTimer or 0) / airCoolingRepairTime, 0, 1) or 0) * 100))
+        printDebug("Air cooling apps", string.format(
+            "73:%s | 74:%s | 75:%.2f | 76:%.2f | 77:%.2f | 78:%s | 79:%.2f",
+            tostring(acCarPhysics.controllerInputs[73]),
+            tostring(acCarPhysics.controllerInputs[74]),
+            tonumber(acCarPhysics.controllerInputs[75]) or 0,
+            tonumber(acCarPhysics.controllerInputs[76]) or 0,
+            tonumber(acCarPhysics.controllerInputs[77]) or 0,
+            tostring(acCarPhysics.controllerInputs[78]),
+            tonumber(acCarPhysics.controllerInputs[79]) or 0))
         printDebug("Tyres", string.format("Spares: %s | Time: %.2f", tostring(currentSpares), carStoppedTimer))
         printDebug("Brake Damage", brakesFailed)
         printDebug("Gearbox Failure", "Status: " .. tostring(isGearboxFailed))
@@ -2139,12 +1665,35 @@ function update(dt)
         tonumber(oilPressureFailureMaxDamage) or 1,
         tostring(oilPressureFailureActive)
     ))
+        printDebug("Oil system", string.format(
+        "Pressure: %.1f psi | Tank: %.2f L | Gallery: %.3f L | Pump: %s",
+        tonumber(oilPressurePsi) or 0,
+        tonumber(oilTankCurrentLitres) or 0,
+        tonumber(oilEngineGalleryLitres) or 0,
+        tostring(oilManualPumpIsActive)
+    ))
 
         printDebug("Fuel Pump failure", string.format(
             "Gas: %.3f | Fuel flows: %.1f%% | Status: %s",
             tonumber(acCarPhysics.gas) or 0,  -- Ensuring gas is a number, default to 0 if nil
-            tonumber(fuelPumpFailureCooldown) or 0,  -- Ensure a valid number
+            tonumber(fuelPumpFailureCooldown) or 0,  -- Ensure a valid number (module-local; shows 0 in debug)
             tostring(fuelPumpFailed) -- Convert boolean/nil to string safely
+        ))
+        printDebug("Fuel Tank Pressure", string.format(
+            "Enabled: %s | Pressure: %.2f psi | Pump: %s | Low: %s | Cut: %s",
+            tostring(manualFuelPressurizationEnabled),
+            tonumber(fuelTankPressurePsi) or 0,
+            tostring(fuelTankPressurizationPumpActive),
+            tostring(fuelTankPressureLow),
+            tostring(fuelTankPressureFuelCutActive)
+        ))
+        printDebug("Spark plugs", string.format(
+            "Fouled: %d/%d | Dead cylinders: %d | Repair: %s | Roadside: %s",
+            getFouledSparkPlugCount(),
+            getSparkPlugTotalCount(),
+            getDeadSparkCylinderCount(),
+            tostring(sparkPlugRepairInProgress),
+            tostring(sparkPlugRoadsideRepairInProgress)
         ))
         --printDebug("Fuel Pump Repair", string.format("[%-30s] %.1f sec left", string.rep("#", (fuelPumpPitTimer / fuelPumpRepairTime) * 30), fuelPumpRepairTime - fuelPumpPitTimer))
 
@@ -2154,8 +1703,8 @@ function update(dt)
     end
 
     -- PSG update loop
-    if gearboxIsPSG then
-        
+    if isWilsonPreselectorGearboxEnabled() then
+
         if not psgInitialized then
             initPSG(ac, overheadMessageQueue)
             psgInitialized = true
@@ -2163,6 +1712,8 @@ function update(dt)
 
         updatePSG(dt,thisCar)
     end
+
+    updateFailedGearEffect(dt)
 
     acCarPhysics.controllerInputs[2] = currentSpares
     acCarPhysics.controllerInputs[4] = brakesFailed
@@ -2242,9 +1793,16 @@ function update(dt)
 
     -- 0 = nothing's happening, 1 = fetching tyre, 2 = changing tyre, 3 = tyre change done
     acCarPhysics.controllerInputs[42] = roadsideTyreChange
-    -- 43 - 48: electricity stuff
-    -- 49 & 50 == PSG
+    -- 43 - 48: electrical system outputs; 49 - 50: Wilson preselector outputs.
     acCarPhysics.controllerInputs[51] = ignitionType
-    -- 52 == Alternator being repaired 0 or 1
+    -- 52: alternator belt repair; 53 - 62: oil system; 63 - 68: fuel pressure.
+    acCarPhysics.controllerInputs[69] = getFouledSparkPlugCount()
+    acCarPhysics.controllerInputs[70] = getDeadSparkCylinderCount()
+    acCarPhysics.controllerInputs[71] = getSparkPlugPowerLossFraction()
+    acCarPhysics.controllerInputs[72] = sparkPlugRepairInProgress or sparkPlugRoadsideRepairInProgress
+    acCarPhysics.controllerInputs[73] = coolingSystemType
+    -- 74 - 79: air-cooling fault and repair outputs.
+    -- 80: crash fire active; 81: intensity; 82: time remaining fraction.
+    -- 83: animationsState helper; only for PSG for now
 end
 -- MAIN UPDATE ENDS
